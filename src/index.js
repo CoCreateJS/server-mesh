@@ -30,6 +30,7 @@ const pruneTimers = new Map();
 let isReconciliationRunning = false;
 let isGracefulExitRunning = false;
 
+
 /**
  * Safely normalizes Mongo/BSON/JSON ObjectId definitions to standard 24-character strings.
  * Ensures strict JavaScript type parity ('===') during sorting and matches.
@@ -54,6 +55,7 @@ function normalizePeersList(result) {
     return [];
 }
 
+
 /**
  * Resolves the global network cluster state and orchestrates direct socket links.
  * Employs a deterministic, alphabetical sort logic based on server ObjectId strings.
@@ -74,6 +76,32 @@ async function reconcilePeerConnections(server, socketServer) {
             isReconciliationRunning = false;
             return;
         }
+
+        // Clean up legacy zombie servers matching our specific infrastructure instanceId
+        const instanceId = server.infrastructure?.instanceId;
+        if (instanceId) {
+            console.log(`[@cocreate/socket-mesh] Pruning legacy zombie servers sharing instanceId: ${instanceId}`);
+            try {
+                // Execute a clean, direct deletion targeting the standardized camelCase key
+                await server.crud.send({
+                    method: 'object.delete',
+                    array: 'servers',
+                    $filter: {
+                        query: {
+                            'infrastructure.instanceId': instanceId
+                        },
+                        limit: 0 // Target and wipe all duplicate matches in the collection
+                    },
+                    organization_id: server.organization_id,
+                    host: server.host
+                });
+
+                console.log(`[@cocreate/socket-mesh] Legacy registrations pruned successfully for instanceId: ${instanceId}`);
+            } catch (pruneErr) {
+                console.warn(`[@cocreate/socket-mesh] Non-blocking warning during legacy instance cleanup:`, pruneErr.message);
+            }
+        }
+
 
         // Heartbeat payload using "upsert: true" to safely register on boot and modify on ticks
         const registerPayload = {
@@ -130,6 +158,7 @@ async function reconcilePeerConnections(server, socketServer) {
 
         console.log(`[@cocreate/socket-mesh] Found ${peers.length} priority peers to connect to (Node ID: ${server.id})`);
 
+
         // Negotiate outbound connections strictly to the retrieved lower-ID peers
         for (const targetPeer of peers) {
             const targetIp = targetPeer.ip;
@@ -179,6 +208,7 @@ async function reconcilePeerConnections(server, socketServer) {
                         activeConnections.set(targetIp, clientSocket);
                         socketServer.onWebSocket(clientSocket);
                     });
+
 
                     clientSocket.on('close', () => {
                         activeConnections.delete(targetIp);
@@ -242,12 +272,13 @@ async function reconcilePeerConnections(server, socketServer) {
                         }
                     });
 
+
                     // Listen for fast mesh control messages (e.g., prune cancellations)
                     clientSocket.on('message', (rawData) => {
                         try {
                             const msg = JSON.parse(rawData);
                             if (msg.type === 'mesh.peer_pruned' && msg.deadIp) {
-                                const activeTimerId = pruneTimers.get(msg.deadIp);
+                                const activeTimerId = prunePruneGet = pruneTimers.get(msg.deadIp);
                                 if (activeTimerId) {
                                     console.log(`[@cocreate/socket-mesh] Received remote prune confirmation for ${msg.deadIp}. Canceling local DB write.`);
                                     clearTimeout(activeTimerId);
@@ -261,7 +292,6 @@ async function reconcilePeerConnections(server, socketServer) {
 
                     clientSocket.on('error', (err) => {
                         console.error(`[@cocreate/socket-mesh] Link error to peer ${targetIp}:`, err.message);
-                        // The 'close' event fires immediately after an 'error' event, so retries are handled there
                     });
 
                 } catch (connectionError) {
@@ -279,6 +309,7 @@ async function reconcilePeerConnections(server, socketServer) {
         isReconciliationRunning = false;
     }
 }
+
 
 /**
  * Binds a custom outbound event observer on standard SocketServer transmissions.
@@ -315,6 +346,7 @@ function setupOutboundForwarding(server, socketServer) {
 
     console.log(`[@cocreate/socket-mesh] Registered outbound event forwarder on Socket Server.`);
 }
+
 
 /**
  * Gracefully prunes our registered server node from the primary DB collection during system shutdown.
@@ -359,6 +391,7 @@ async function pruneAndExit(server) {
         process.exit(0);
     }
 }
+
 
 /**
  * Symmetrical Platform Mesh Manager Initializer
