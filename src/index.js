@@ -563,8 +563,6 @@ async function handleGracefulShutdown() {
 async function getServers() {
     if (isGracefulExitRunning || !serverCtx?.crud) return;
 
-    console.log(`[@cocreate/socket-mesh] Starting startup peer reconciliation...`);
-
     const instanceId = serverCtx.infrastructure?.instanceId;
     if (instanceId) {
         try {
