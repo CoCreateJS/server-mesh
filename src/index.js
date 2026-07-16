@@ -23,30 +23,16 @@ import path from 'node:path';
 import os from 'node:os';
 import cluster from 'node:cluster';
 import { execSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import crypto from 'node:crypto';
 
-// Registry tracking active peer WebSocket connections (serverId/IP -> WebSocket)
-const activeConnections = new Map();
+const activeConnections = new Map();     // serverId/IP -> WebSocket P2P tunnels
+const retryTimers = new Map();           // peerIp -> Timeout ID
+const pruneTimers = new Map();           // peerIp -> Timeout ID
+const orgWorkers = new Map();            // organization_id -> Set(workerId)
+const orgServers = new Map();            // organization_id -> Set(WebSocket)
 
-// Registry of scheduled reconnect timers to allow cancellation (peerIp -> Timeout ID)
-const retryTimers = new Map();
-
-// Registry of scheduled DB prune operations to allow cancellation (peerIp -> Timeout ID)
-const pruneTimers = new Map();
-
-// Local-Tier Routing Map: Matches active organizations to local worker IDs
-// Key: organization_id -> Value: Set(workerId)
-const orgWorkers = new Map();
-
-// Network-Tier Routing Map: Matches active organizations to connected peer sockets
-// Key: organization_id -> Value: Set(WebSocket)
-const orgServers = new Map();
-
-// Execution flags to block overlapping async operations
-let isReconciliationRunning = false;
 let isGracefulExitRunning = false;
-
-// Interval heartbeats and ping timers
-let dbHeartbeatInterval = null;
 let wsPingInterval = null;
 
 let serverCtx = null;
@@ -55,20 +41,176 @@ let meshWss = null;
 let secureMeshServer = null;
 
 /**
- * Safely normalizes Mongo/BSON/JSON ObjectId definitions to standard 24-character strings.
- * Ensures strict JavaScript type parity ('===') during sorting and matches.
+ * Safely loops and sends JSON payloads to one or multiple sockets.
+ * Wraps individual operations in independent try-catch layers to avoid process instability.
+ * 
+ * @param {WebSocket|WebSocket[]} sockets - Target WebSocket(s)
+ * @param {Object} data - Payload content to dispatch
  */
-function getObjectIdString(idVal) {
-    if (!idVal) return '';
-    if (typeof idVal === 'string') return idVal;
-    if (idVal.$oid) return idVal.$oid;
-    if (typeof idVal.toString === 'function') return idVal.toString();
-    return String(idVal);
+function socketSend(sockets, data) {
+    const targetSockets = Array.isArray(sockets) ? sockets : [sockets];
+    const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
+
+    for (const socket of targetSockets) {
+        try {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(dataStr);
+            }
+        } catch (err) {
+            console.error(`[@cocreate/socket-mesh] Error executing socketSend transaction:`, err.message);
+        }
+    }
 }
 
 /**
- * Extracts the raw dataset array from standard CRUD server responses.
- * Accommodates variations across Point-Queries, Data envelopes, and arrays.
+ * SocketMesh acts as a pure transport fabric. It blindly dispatches
+ * all inbound network payloads as standard EventEmitter events.
+ */
+class SocketMesh extends EventEmitter {
+    constructor() {
+        super();
+    }
+
+    /**
+     * Sends a payload across the secure network mesh.
+     * Automatically appends a unique ID (uid) to guarantee end-to-end tracking.
+     * 
+     * @param {Object} payload - Object to transmit containing a required 'method'
+     */
+    send(payload) {
+        if (!payload || !payload.method) {
+            console.error("[@cocreate/socket-mesh] [MESH ERROR] Cannot transmit mesh payload without a defined 'method' key.");
+            return;
+        }
+
+        // Standardize: Every outgoing message must have a unique identifier (uid)
+        if (!payload.uid) {
+            payload.uid = crypto.randomUUID();
+        }
+
+        const isPrimary = serverCtx?.isPrimary;
+
+        if (!isPrimary) {
+            // Worker Thread: Forward to Master process via native child IPC to relay
+            if (typeof process.send === 'function') {
+                process.send({
+                    method: 'mesh.outbound_mesh_relay',
+                    payload: payload
+                });
+            }
+        } else {
+            // Master Process: Determine target sockets dynamically based on payload directives
+            const targets = [];
+
+            if (payload.broadcast === true || !payload.servers) {
+                // Symmetrical Cluster Broadcast: Gather all active socket tunnels
+                targets.push(...activeConnections.values());
+            } else {
+                // Multicast/Unicast Routing: Handle polymorphic servers filter (single string or array)
+                const serversList = Array.isArray(payload.servers) 
+                    ? payload.servers 
+                    : [payload.servers];
+
+                for (const id of serversList) {
+                    const socket = activeConnections.get(id);
+                    if (socket) {
+                        targets.push(socket);
+                    }
+                }
+            }
+
+            // Deduplicate target sockets since activeConnections maps both serverId and IP to the same socket
+            const uniqueSockets = Array.from(new Set(targets));
+            
+            // Dispatch safely using standard wrapper loop
+            socketSend(uniqueSockets, payload);
+        }
+    }
+}
+
+const socketMeshInstance = new SocketMesh();
+
+// Listener A: Handle peer registration of an organization subscription
+socketMeshInstance.on('mesh.orgAdded', (message, ws) => {
+    if (!ws) return;
+    const organization_id = message.organization_id;
+    const ip = ws.remoteAddress || ws._socket?.remoteAddress;
+    const peerId = message.senderId || ip;
+
+    if (!orgServers.has(organization_id)) {
+        orgServers.set(organization_id, new Set());
+    }
+    orgServers.get(organization_id).add(ws);
+    console.log(`[@cocreate/socket-mesh] Peer ${peerId} registered subscription for org "${organization_id}"`);
+});
+
+// Listener B: Handle peer de-registration of an organization subscription
+socketMeshInstance.on('mesh.orgDeleted', (message, ws) => {
+    if (!ws) return;
+    const organization_id = message.organization_id;
+    const ip = ws.remoteAddress || ws._socket?.remoteAddress;
+    const peerId = message.senderId || ip;
+
+    const sockets = orgServers.get(organization_id);
+    if (sockets) {
+        sockets.delete(ws);
+        if (sockets.size === 0) {
+            orgServers.delete(organization_id);
+        }
+        console.log(`[@cocreate/socket-mesh] Peer ${peerId} de-registered subscription from org "${organization_id}"`);
+    }
+});
+
+// Listener C: Handle incoming real-time network unicast transaction data
+socketMeshInstance.on('mesh.orgData', (message) => {
+    const { organization_id, data } = message;
+    
+    // Local Unicast: Relay directly to local child worker threads hosting this tenant
+    const activeWorkerIds = orgWorkers.get(organization_id);
+    if (activeWorkerIds && activeWorkerIds.size > 0 && serverCtx) {
+        try {
+            serverCtx.send({
+                method: 'mesh.inbound',
+                workers: Array.from(activeWorkerIds),
+                master: false,
+                data: typeof data === 'string' ? data : JSON.stringify(data)
+            });
+        } catch (err) {
+            console.error(`[@cocreate/socket-mesh] Failed to relay incoming orgData to workers of org "${organization_id}":`, err.message);
+        }
+    }
+});
+
+// Listener D: Handle cluster coordination to cancel DB prune schedules on peer consensus
+socketMeshInstance.on('mesh.peer_pruned', (message) => {
+    if (message.deadIp) {
+        const activeTimerId = pruneTimers.get(message.deadIp);
+        if (activeTimerId) {
+            clearTimeout(activeTimerId);
+            pruneTimers.delete(message.deadIp);
+            console.log(`[@cocreate/socket-mesh] Cancelled DB prune for ${message.deadIp} due to peer consensus.`);
+        }
+    }
+});
+
+// Listener E: Handle fallback of unhandled incoming network packets
+socketMeshInstance.on('mesh.raw_message', (message) => {
+    if (serverCtx) {
+        try {
+            serverCtx.send({
+                method: 'mesh.inbound',
+                broadcast: true,
+                master: false,
+                data: JSON.stringify(message)
+            });
+        } catch (err) {
+            console.error("[@cocreate/socket-mesh] Failed to relay raw fallback message to workers:", err.message);
+        }
+    }
+});
+
+/**
+ * Extracts raw dataset arrays from standard database responses.
  */
 function normalizePeersList(result) {
     if (!result) return [];
@@ -79,64 +221,31 @@ function normalizePeersList(result) {
 }
 
 /**
- * Generates self-signed TLS credentials on-the-fly for secure inter-node cluster tunnels.
+ * Generates secure, ephemeral TLS credentials on-the-fly for inter-node communication.
  */
 function generateTLSCredentials() {
     const tmpDir = os.tmpdir();
-    const keyPath = path.join(tmpDir, `mesh-key-${Date.now()}.pem`);
-    const certPath = path.join(tmpDir, `mesh-cert-${Date.now()}.pem`);
+    const keyPath = path.join(tmpDir, `mesh-key-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.pem`);
+    const certPath = path.join(tmpDir, `mesh-cert-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.pem`);
 
     try {
-        // Pipe-free generation using standard OpenSSL commands to avoid Node.js /dev/stdin crash
-        execSync(`openssl req -x509 -newkey rsa:2048 -keyout ${keyPath} -out ${certPath} -days 1 -nodes -subj "/CN=localhost"`, { stdio: 'ignore' });
-        
+        execSync(`openssl req -x509 -newkey rsa:2048 -keyout "${keyPath}" -out "${certPath}" -days 1 -nodes -subj "/CN=localhost"`, { stdio: 'ignore' });
         const key = fs.readFileSync(keyPath);
         const cert = fs.readFileSync(certPath);
         
-        // Clean up immediately (Zero-Persistence)
-        fs.unlinkSync(keyPath);
-        fs.unlinkSync(certPath);
-
+        // Cleanup generated temporary certificate files
+        try { fs.unlinkSync(keyPath); } catch {}
+        try { fs.unlinkSync(certPath); } catch {}
+        
         return { key, cert };
     } catch (err) {
-        console.error('[@cocreate/socket-mesh] Failed to generate ephemeral TLS credentials:', err);
+        console.error('[@cocreate/socket-mesh] Failed to generate ephemeral TLS credentials:', err.message);
         return null;
     }
 }
 
 /**
- * Maps a peer's socket connection directly to an organization ID subscription.
- */
-function registerPeerSubscription(peerId, organization_id) {
-    const ws = activeConnections.get(peerId);
-    if (!ws) return;
-
-    if (!orgServers.has(organization_id)) {
-        orgServers.set(organization_id, new Set());
-    }
-    orgServers.get(organization_id).add(ws);
-    console.log(`[@cocreate/socket-mesh] Peer ${peerId} registered for org "${organization_id}"`);
-}
-
-/**
- * Removes a peer's socket connection from an organization ID subscription map.
- */
-function deregisterPeerSubscription(peerId, organization_id) {
-    const ws = activeConnections.get(peerId);
-    if (!ws) return;
-
-    const sockets = orgServers.get(organization_id);
-    if (sockets) {
-        sockets.delete(ws);
-        if (sockets.size === 0) {
-            orgServers.delete(organization_id);
-        }
-        console.log(`[@cocreate/socket-mesh] Peer ${peerId} de-registered from org "${organization_id}"`);
-    }
-}
-
-/**
- * Sweeps and cleans all subscriptions for a dropped WebSocket node connection.
+ * Safely removes a closed socket from all organization maps.
  */
 function removeSocketFromAllOrgServers(ws) {
     for (const [orgId, sockets] of orgServers.entries()) {
@@ -150,42 +259,13 @@ function removeSocketFromAllOrgServers(ws) {
 }
 
 /**
- * Broadcasts one-way control frames notifying active peer servers about our state changes.
+ * Boots the socket mesh and configures routing tunnels.
+ * 
+ * @param {Object} server - CoCreateServer instance context
  */
-function notifyPeersOfOrganizationState(method, organization_id) {
-    const payloadStr = JSON.stringify({
-        method,
-        organization_id,
-        serverId: serverCtx.id
-    });
-    for (const ws of activeConnections.values()) {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(payloadStr);
-        }
-    }
-}
-
-/**
- * Handshake Sync: Transmits our currently active local organizations to a peer connection.
- * Instead of custom formats, we reuse the exact 'mesh.orgAdded' event structure.
- */
-function syncActiveOrganizationsToSocket(ws) {
-    for (const orgId of orgWorkers.keys()) {
-        const payloadStr = JSON.stringify({
-            method: 'mesh.orgAdded',
-            organization_id: orgId,
-            serverId: serverCtx.id
-        });
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(payloadStr);
-        }
-    }
-}
-
 export async function init(server) {
     serverCtx = server;
 
-    // Handle Graceful exit hooks to properly delete DB records and release ports
     process.on('SIGINT', handleGracefulShutdown);
     process.on('SIGTERM', handleGracefulShutdown);
 
@@ -193,85 +273,102 @@ export async function init(server) {
 
     if (!isPrimary) {
         // --- WORKER EVENT PIPELINE ---
-        console.log(`[@cocreate/socket-mesh] Process ${process.pid} is Worker ${serverCtx.workerId}. Setting up event listeners.`);
-        
-        serverCtx.on('mesh.inbound', (payload) => {
-            serverCtx.wsManager.broadcast(payload.data, { isForwarded: true });
+        // Monitor process IPC from Primary
+        process.on('message', (message) => {
+            if (message && message.method) {
+                socketMeshInstance.emit(message.method, message);
+            }
         });
         return;
     }
 
-    // --- MASTER TUNNEL & DUAL-TIER UNICAST ROUTING PIPELINE ---
-    console.log(`[@cocreate/socket-mesh] Primary Orchestrator running on PID ${process.pid}. Initializing secure mesh...`);
-    
-    // Listen to local worker registrations
-    serverCtx.on('mesh.registerOrg', (payload) => {
-        const { organization_id, workerId } = payload;
-        
-        let isNewOrganizationOnServer = false;
-        if (!orgWorkers.has(organization_id)) {
-            orgWorkers.set(organization_id, new Set());
-            isNewOrganizationOnServer = true;
-        }
-        
-        orgWorkers.get(organization_id).add(workerId);
-        console.log(`[@cocreate/socket-mesh] [LOCAL-MAP] Org "${organization_id}" mapped to Worker ${workerId}`);
+    // --- MASTER TUNNEL & UNICAST ROUTING PIPELINE ---
+    // Handle incoming IPC registrations from child workers
+    cluster.on('message', (workerRef, message) => {
+        if (message && message.method) {
+            if (message.method === 'mesh.registerOrg') {
+                const { organization_id, workerId } = message;
+                let isNewOrg = false;
 
-        if (isNewOrganizationOnServer) {
-            notifyPeersOfOrganizationState('mesh.orgAdded', organization_id);
-        }
-    });
+                if (!orgWorkers.has(organization_id)) {
+                    orgWorkers.set(organization_id, new Set());
+                    isNewOrg = true;
+                }
 
-    // Listen to local worker deregistrations
-    serverCtx.on('mesh.deregisterOrg', (payload) => {
-        const { organization_id, workerId } = payload;
+                orgWorkers.get(organization_id).add(workerId);
+                console.log(`[@cocreate/socket-mesh] [LOCAL-MAP] Tenant "${organization_id}" registered on Worker ${workerId}`);
 
-        const workersSet = orgWorkers.get(organization_id);
-        workersSet.delete(workerId);
-        if (workersSet.size === 0) {
-            orgWorkers.delete(organization_id);
-            console.log(`[@cocreate/socket-mesh] [LOCAL-MAP] Org "${organization_id}" evicted. No remaining local workers.`);
-            
-            notifyPeersOfOrganizationState('mesh.orgDeleted', organization_id);
-        }
-    });
+                if (isNewOrg) {
+                    socketMeshInstance.send({
+                        method: 'mesh.orgAdded',
+                        organization_id,
+                        senderId: serverCtx.id
+                    });
+                }
+            } 
+            else if (message.method === 'mesh.deregisterOrg') {
+                const { organization_id, workerId } = message;
+                const workersSet = orgWorkers.get(organization_id);
 
-    // Dynamic dual-tier unicast mapping execution
-    serverCtx.on('mesh.orgData', (payload) => {
-        const { organization_id, data, senderWorkerId } = payload;
+                if (workersSet) {
+                    workersSet.delete(workerId);
+                    if (workersSet.size === 0) {
+                        orgWorkers.delete(organization_id);
+                        console.log(`[@cocreate/socket-mesh] [LOCAL-MAP] Tenant "${organization_id}" evicted. No remaining local workers.`);
+                        socketMeshInstance.send({
+                            method: 'mesh.orgDeleted',
+                            organization_id,
+                            senderId: serverCtx.id
+                        });
+                    }
+                }
+            } 
+            else if (message.method === 'mesh.orgData') {
+                const { organization_id, data, senderWorkerId } = message;
 
-        // Step A: Distribute locally to other worker processes (Local Unicast - Excluding the original sender!)
-        const activeWorkerIds = orgWorkers.get(organization_id);
-        if (activeWorkerIds && activeWorkerIds.size > 0) {
-            const siblingWorkerIds = Array.from(activeWorkerIds).filter(wId => wId !== senderWorkerId);
-            if (siblingWorkerIds.length > 0) {
-                serverCtx.send({
-                    method: 'mesh.inbound',
-                    workers: siblingWorkerIds,
-                    master: false,
-                    data: typeof data === 'string' ? data : JSON.stringify(data)
-                });
-            }
-        }
+                // Local Unicast: Relay directly to child worker cores hosting the tenant (ignoring sender)
+                const activeWorkerIds = orgWorkers.get(organization_id);
+                if (activeWorkerIds && activeWorkerIds.size > 0) {
+                    const siblingWorkerIds = Array.from(activeWorkerIds).filter(wId => wId !== senderWorkerId);
+                    if (siblingWorkerIds.length > 0) {
+                        try {
+                            serverCtx.send({
+                                method: 'mesh.inbound',
+                                workers: siblingWorkerIds,
+                                master: false,
+                                data: typeof data === 'string' ? data : JSON.stringify(data)
+                            });
+                        } catch (err) {
+                            console.error("[@cocreate/socket-mesh] Failed to propagate orgData to local siblings:", err.message);
+                        }
+                    }
+                }
 
-        // Step B: Relay across P2P tunnels to connected peer servers hosting this tenant (Network Unicast)
-        const targetSockets = orgServers.get(organization_id);
-        if (targetSockets && targetSockets.size > 0) {
-            const envelope = JSON.stringify({
-                method: 'mesh.orgData',
-                organization_id,
-                data
-            });
-            for (const ws of targetSockets) {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(envelope);
+                // Network Unicast: Relay over secure tunnels to peer servers hosting the tenant
+                const targetSockets = orgServers.get(organization_id);
+                if (targetSockets && targetSockets.size > 0) {
+                    const envelope = {
+                        method: 'mesh.orgData',
+                        organization_id,
+                        data
+                    };
+                    socketSend(Array.from(targetSockets), envelope);
+                }
+            } 
+            else if (message.method === 'mesh.outbound_mesh_relay') {
+                // Relay child worker message out to peer nodes
+                if (message.payload) {
+                    socketMeshInstance.send(message.payload);
                 }
             }
+            
+            // Mirror all incoming process IPC commands to local listeners
+            socketMeshInstance.emit(message.method, message, workerRef);
         }
     });
 
+    // Boot HTTPS Secure Server
     const credentials = generateTLSCredentials();
-    
     if (credentials) {
         secureMeshServer = https.createServer(credentials);
         secureMeshServer.on('error', (err) => {
@@ -296,23 +393,32 @@ export async function init(server) {
         const ip = req.socket.remoteAddress;
         let remoteServerId = null;
 
-        // Decode subprotocol header to resolve serverId identification directly on handshake
         const protocolHeader = req.headers['sec-websocket-protocol'];
         if (protocolHeader) {
-            const parsed = JSON.parse(decodeURIComponent(protocolHeader));
-            remoteServerId = parsed.id;
+            try {
+                const parsed = JSON.parse(decodeURIComponent(protocolHeader));
+                remoteServerId = parsed.id;
+            } catch (err) {
+                // Ignore decoding anomalies gracefully
+            }
         }
 
         const identifier = remoteServerId || ip;
-        console.log(`[@cocreate/socket-mesh] Incoming peer connection established with identifier: ${identifier}`);
+        console.log(`[@cocreate/socket-mesh] Secure peer connection established: ${identifier}`);
         
         ws.isAlive = true;
-        ws.on('pong', () => {
-            ws.isAlive = true;
-        });
+        ws.on('pong', () => { ws.isAlive = true; });
 
-        ws.on('message', (message) => {
-            handleIncomingMessage(message, ip, ws);
+        // Inlined Blind Event-Dispatch Loop: If no method, do nothing.
+        ws.on('message', (rawData) => {
+            try {
+                const message = JSON.parse(rawData.toString());
+                if (message && message.method) {
+                    socketMeshInstance.emit(message.method, message, ws);
+                }
+            } catch (err) {
+                // Safely catch parsing failures
+            }
         });
 
         ws.on('close', () => {
@@ -323,34 +429,28 @@ export async function init(server) {
         });
         
         ws.on('error', (err) => {
-            console.error(`[@cocreate/socket-mesh] Peer connection error (${identifier}):`, err.message);
+            console.error(`[@cocreate/socket-mesh] Connection error (${identifier}):`, err.message);
         });
         
         activeConnections.set(identifier, ws);
-        if (remoteServerId) {
-            activeConnections.set(ip, ws); // Map both for immediate index lookups
-        }
-
-        // Symmetric Handshake Exchange: On connection, push our active org list as orgAdded frames
-        syncActiveOrganizationsToSocket(ws);
+        if (remoteServerId) activeConnections.set(ip, ws);
     });
 
-    // Run Symmetrical Startup Connection Sync EXACTLY ONCE on boot.
-    await reconcilePeerConnections();
+    try {
+        await getServers();
+    } catch (err) {
+        console.error("[@cocreate/socket-mesh] Peer discovery reconciliation cycle failed on start:", err.message);
+    }
     
-    // Set up database-only heartbeat updates (write-only, zero database reads!)
-    dbHeartbeatInterval = setInterval(publishDatabaseHeartbeat, 30000); 
-
-    // Set up network-level WebSocket ping/pong checks (fully decentralized, zero DB overhead!)
     wsPingInterval = setInterval(pingActiveWebsockets, 30000);
 }
 
+
 /**
- * Executes a lightweight DB-only write heartbeat to register/keep our presence warm.
- * This runs with ZERO read queries, keeping database load near non-existent.
+ * Registers this server instance once on startup to allow discovery.
  */
-async function publishDatabaseHeartbeat() {
-    if (isGracefulExitRunning) return;
+async function registerServer() {
+    if (isGracefulExitRunning || !serverCtx?.crud) return;
 
     const registerPayload = {
         method: 'object.update',
@@ -361,22 +461,26 @@ async function publishDatabaseHeartbeat() {
             ip: serverCtx.ip,
             host: serverCtx.host,
             status: 'active',
-            infrastructure: serverCtx.infrastructure,
-            lastSeen: new Date().toISOString()
+            infrastructure: serverCtx.infrastructure
         },
         organization_id: serverCtx.organization_id,
         host: serverCtx.host
     };
 
-    const registerResult = await serverCtx.crud.send(registerPayload);
-    if (registerResult && registerResult.error) {
-        throw new Error(`[@cocreate/socket-mesh] Heartbeat registration rejected: ${JSON.stringify(registerResult.error)}`);
+    try {
+        const registerResult = await serverCtx.crud.send(registerPayload);
+        if (registerResult && registerResult.error) {
+            console.error(`[@cocreate/socket-mesh] Startup registration rejected: ${JSON.stringify(registerResult.error)}`);
+        } else {
+            console.log(`[@cocreate/socket-mesh] Successfully registered server profile in db.`);
+        }
+    } catch (err) {
+        console.error("[@cocreate/socket-mesh] Startup registration network error:", err.message);
     }
 }
 
 /**
- * Pings all connected server sockets to quickly catch half-open TCP failures.
- * This ensures silent network disconnects are cleaned up without hitting any database.
+ * Monitors responsiveness of active WebSocket connections.
  */
 function pingActiveWebsockets() {
     if (isGracefulExitRunning || !meshWss) return;
@@ -387,12 +491,16 @@ function pingActiveWebsockets() {
             return ws.terminate();
         }
         ws.isAlive = false;
-        ws.ping();
+        try {
+            ws.ping();
+        } catch (err) {
+            console.error("[@cocreate/socket-mesh] Error during websocket ping:", err.message);
+        }
     });
 }
 
 /**
- * Executes a full graceful shutdown: wipes our DB record, clears intervals, and frees the network ports
+ * Cleanly handles node evictions and releases network bindings.
  */
 async function handleGracefulShutdown() {
     if (isGracefulExitRunning) return;
@@ -400,108 +508,113 @@ async function handleGracefulShutdown() {
     
     console.log(`\n[@cocreate/socket-mesh] Graceful shutdown initiated. Cleaning up mesh state...`);
 
-    // Clear all recurring utility intervals
-    clearInterval(dbHeartbeatInterval);
     clearInterval(wsPingInterval);
 
-    // 1. Unregister from the database to prevent ghost/zombie nodes
-    if (serverCtx && serverCtx.crud && serverCtx.id && serverCtx.organization_id) {
-        await serverCtx.crud.send({
-            method: 'object.delete',
-            array: 'servers',
-            object: { _id: serverCtx.id },
-            organization_id: serverCtx.organization_id,
-            host: serverCtx.host
-        });
-        console.log(`[@cocreate/socket-mesh] Successfully wiped server ${serverCtx.id} from DB.`);
+    if (serverCtx?.crud && serverCtx.id && serverCtx.organization_id) {
+        try {
+            await serverCtx.crud.send({
+                method: 'object.delete',
+                array: 'servers',
+                object: { _id: serverCtx.id },
+                organization_id: serverCtx.organization_id,
+                host: serverCtx.host
+            });
+            console.log(`[@cocreate/socket-mesh] Server record wiped from database.`);
+        } catch (err) {
+            console.error("[@cocreate/socket-mesh] Failed to wipe server status cleanly from DB:", err.message);
+        }
     }
 
-    // 2. Clear all active retry and prune timers
     for (const timerId of retryTimers.values()) clearTimeout(timerId);
     for (const timerId of pruneTimers.values()) clearTimeout(timerId);
     retryTimers.clear();
     pruneTimers.clear();
 
-    // 3. Close all active outbound P2P sockets
-    for (const [ip, ws] of activeConnections.entries()) {
-        if (ws.readyState === WebSocket.OPEN) ws.close();
+    const uniqueSockets = new Set(activeConnections.values());
+    for (const ws of uniqueSockets) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            try { ws.close(); } catch {}
+        }
     }
     activeConnections.clear();
 
-    // 4. Release Port and exit
-    meshWss.close();
-    secureMeshServer.close(() => {
-        console.log(`[@cocreate/socket-mesh] Port ${MESH_PORT} successfully released.`);
-        process.exit(0);
-    });
+    if (meshWss) {
+        try { meshWss.close(); } catch {}
+    }
 
-    // Failsafe: Force kill if the DB/Sockets hang for more than 3 seconds
+    if (secureMeshServer) {
+        secureMeshServer.close(() => {
+            console.log(`[@cocreate/socket-mesh] Port ${MESH_PORT} successfully released.`);
+            process.exit(0);
+        });
+    } else {
+        process.exit(0);
+    }
+
     setTimeout(() => {
-        console.warn('[@cocreate/socket-mesh] Graceful exit timed out. Forcing exit.');
+        console.warn('[@cocreate/socket-mesh] Force-exiting gracefully hung process.');
         process.exit(1);
     }, 3000).unref();
 }
 
 /**
- * Resolves the global network cluster state and orchestrates direct socket links.
- * Employs a chronological sort logic based on server database IDs to prevent routing loops.
- * This is executed ONCE on startup.
+ * Scans for peer nodes, establishes direct connections, and schedules lazy prunes.
  */
-async function reconcilePeerConnections() {
-    if (isReconciliationRunning || isGracefulExitRunning || !serverCtx.crud) return;
-    isReconciliationRunning = true;
+async function getServers() {
+    if (isGracefulExitRunning || !serverCtx?.crud) return;
 
     console.log(`[@cocreate/socket-mesh] Starting startup peer reconciliation...`);
 
-    // Check 1: Ensure IP address is active
-    if (!serverCtx.ip) {
-        throw new Error(`[@cocreate/socket-mesh] Assertion failed: Server core IP address is unresolved.`);
-    }
-
-    // Clean up legacy zombie servers matching our specific infrastructure instanceId
     const instanceId = serverCtx.infrastructure?.instanceId;
     if (instanceId) {
-        await serverCtx.crud.send({
-            method: 'object.delete',
-            array: 'servers',
-            $filter: {
-                query: { 'infrastructure.instanceId': instanceId },
-                limit: 0
-            },
-            organization_id: serverCtx.organization_id,
-            host: serverCtx.host
-        });
+        try {
+            await serverCtx.crud.send({
+                method: 'object.delete',
+                array: 'servers',
+                $filter: {
+                    query: { 'infrastructure.instanceId': instanceId },
+                    limit: 0
+                },
+                organization_id: serverCtx.organization_id,
+                host: serverCtx.host
+            });
+        } catch (err) {
+            console.warn("[@cocreate/socket-mesh] Startup instance-eviction run failed/skipped:", err.message);
+        }
     }
 
-    // Keep our registration fresh right before query
-    await publishDatabaseHeartbeat();
+    // Register profile once on boot
+    await registerServer();
 
-    // Query to read registered servers inside the organization scope
-    // Strictly targeting peers with an ID less than ours to prevent socket loops.
     const readPayload = {
         method: 'object.read',
         array: 'servers',
         $filter: {
             query: { _id: { $lt: serverCtx.id } },
-            sort: { _id: 1 }, // Sort ascending
+            sort: { _id: 1 },
             limit: 0
         },
         organization_id: serverCtx.organization_id,
         host: serverCtx.host
     };
 
-    const readResult = await serverCtx.crud.send(readPayload);
+    let readResult;
+    try {
+        readResult = await serverCtx.crud.send(readPayload);
+    } catch (err) {
+        console.error("[@cocreate/socket-mesh] Failed to fetch active peer server records:", err.message);
+        return;
+    }
+
     const peers = normalizePeersList(readResult);
 
-    // Negotiate outbound connections strictly to the retrieved lower-ID peers
     for (const targetPeer of peers) {
         const targetIp = targetPeer.ip;
 
-        // Self-IP Guard: Never attempt to open a socket tunnel to our own IP address
         if (targetIp === serverCtx.ip) continue;
-        if (activeConnections.has(targetIp)) continue; // Tunnel is already warm
+        if (activeConnections.has(targetIp)) continue;
 
-        console.log(`[@cocreate/socket-mesh] Opening socket tunnel to priority peer: ${targetIp}`);
+        console.log(`[@cocreate/socket-mesh] Initiating secure connection stream to target: ${targetIp}`);
 
         let retryCount = 0;
         const maxRetries = 10;
@@ -509,9 +622,7 @@ async function reconcilePeerConnections() {
         const connectToPeer = () => {
             if (isGracefulExitRunning) return; 
 
-            // Symmetrical tunnel configuration pointing directly to secure WS endpoint
             const targetUrl = `wss://${targetIp}:${MESH_PORT}/${serverCtx.organization_id}`;
-
             const clientSocket = new WebSocket(targetUrl, [
                 encodeURIComponent(JSON.stringify({
                     type: 'peer',
@@ -521,23 +632,18 @@ async function reconcilePeerConnections() {
                     sniHost: serverCtx.host
                 }))
             ], {
-                servername: serverCtx.host, // Map TLS SNI explicitly
-                rejectUnauthorized: false // Development safety fallback for direct IP-to-IP bridges
+                servername: serverCtx.host,
+                rejectUnauthorized: false
             });
 
             clientSocket.isAlive = true;
-            clientSocket.on('pong', () => {
-                clientSocket.isAlive = true;
-            });
-            clientSocket.on('ping', () => {
-                clientSocket.pong();
-            });
+            clientSocket.on('pong', () => { clientSocket.isAlive = true; });
+            clientSocket.on('ping', () => { clientSocket.pong(); });
 
             clientSocket.on('open', () => {
-                console.log(`[@cocreate/socket-mesh] Tunnel successfully established to peer: ${targetIp}`);
+                console.log(`[@cocreate/socket-mesh] Secure link complete to peer: ${targetIp}`);
                 retryCount = 0;
                 
-                // Clear pending timers
                 if (retryTimers.has(targetIp)) clearTimeout(retryTimers.get(targetIp));
                 if (pruneTimers.has(targetIp)) clearTimeout(pruneTimers.get(targetIp));
                 
@@ -547,12 +653,8 @@ async function reconcilePeerConnections() {
                 clientSocket.isPeer = true;
                 clientSocket.isPlatformTunnel = true;
                 
-                // Store the established connection inside our connections lookup registry
                 activeConnections.set(targetPeer._id, clientSocket);
                 activeConnections.set(targetIp, clientSocket);
-
-                // Symmetric Handshake Exchange: On connection open, push our active org list down the tunnel
-                syncActiveOrganizationsToSocket(clientSocket);
             });
 
             clientSocket.on('close', () => {
@@ -565,40 +667,35 @@ async function reconcilePeerConnections() {
 
                 if (retryCount < maxRetries) {
                     retryCount++;
-                    // Reconnect Jitter: 0 to 2 seconds of random delay to stagger reconnects
-                    const jitter = Math.floor(Math.random() * 2000);
-                    const delay = 5000 + jitter;
-                    
-                    console.warn(`[@cocreate/socket-mesh] Tunnel closed to peer: ${targetIp}. Retrying (${retryCount}/${maxRetries}) in ${delay}ms...`);
+                    const delay = 5000 + Math.floor(Math.random() * 2000);
+                    console.warn(`[@cocreate/socket-mesh] Peer disconnected. Retrying in ${delay}ms...`);
                     const timerId = setTimeout(connectToPeer, delay);
                     retryTimers.set(targetIp, timerId);
                 } else {
-                    // Thundering Herd Prevention: Stagger deletions using relative index
                     const staggerDelay = peers.length * 1000;
-                    console.warn(`[@cocreate/socket-mesh] Peer ${targetIp} dead. Scheduling DB prune in ${staggerDelay}ms...`);
+                    console.warn(`[@cocreate/socket-mesh] Peer dead. Scheduling db prune in ${staggerDelay}ms...`);
                     
-                    const pruneTimerId = setTimeout(() => {
-                        console.error(`[@cocreate/socket-mesh] Executing DB prune for dead peer: ${targetIp}`);
+                    const pruneTimerId = setTimeout(async () => {
+                        console.error(`[@cocreate/socket-mesh] Pruning unresponsive node: ${targetIp}`);
                         
-                        serverCtx.crud.send({
-                            method: 'object.delete',
-                            array: 'servers',
-                            object: { _id: targetPeer._id },
-                            organization_id: serverCtx.organization_id,
-                            host: serverCtx.host
-                        });
+                        try {
+                            await serverCtx.crud.send({
+                                method: 'object.delete',
+                                array: 'servers',
+                                object: { _id: targetPeer._id },
+                                organization_id: serverCtx.organization_id,
+                                host: serverCtx.host
+                            });
+                        } catch (err) {
+                            console.error(`[@cocreate/socket-mesh] Failed to prune node ${targetIp} from database:`, err.message);
+                        }
                         
-                        // Broadcast fast mesh control message to tell others to cancel prune timers
-                        const cancelPayload = {
-                            type: 'mesh.peer_pruned',
+                        // Symmetrical Consensus Broadcast: Emits with standard uuid tracking
+                        socketMeshInstance.send({
+                            method: 'mesh.peer_pruned',
                             deadIp: targetIp,
                             isForwarded: true,
-                            originatorId: serverCtx.id
-                        };
-                        const payloadStr = JSON.stringify(cancelPayload);
-                        
-                        activeConnections.forEach(peerSocket => {
-                            if (peerSocket.readyState === WebSocket.OPEN) peerSocket.send(payloadStr);
+                            senderId: serverCtx.id
                         });
                         
                         pruneTimers.delete(targetIp);
@@ -608,109 +705,29 @@ async function reconcilePeerConnections() {
                 }
             });
 
+            // Inlined Blind Event-Dispatch Loop
             clientSocket.on('message', (rawData) => {
                 try {
-                    const msg = JSON.parse(rawData);
-                    
-                    // Intercept fast mesh control messages (e.g., prune cancellations)
-                    if (msg.type === 'mesh.peer_pruned' && msg.deadIp) {
-                        const activeTimerId = pruneTimers.get(msg.deadIp);
-                        if (activeTimerId) {
-                            clearTimeout(activeTimerId);
-                            pruneTimers.delete(msg.deadIp);
-                            console.log(`[@cocreate/socket-mesh] Cancelled DB prune for ${msg.deadIp} due to cluster consensus.`);
-                        }
-                        return; // Handled internally
+                    const message = JSON.parse(rawData.toString());
+                    if (message && message.method) {
+                        socketMeshInstance.emit(message.method, message, clientSocket);
                     }
-                } catch(e) { }
-
-                handleIncomingMessage(rawData, targetIp, clientSocket);
+                } catch (err) {
+                    // Safely catch parsing failures
+                }
             });
 
             clientSocket.on('error', (err) => {
-                console.log(`[@cocreate/socket-mesh] Error on connection to ${targetIp}: ${err.message}`);
+                console.log(`[@cocreate/socket-mesh] Socket transport failure: ${err.message}`);
             });
         };
 
-        // Trigger the initial outbound connection attempt
         connectToPeer();
     }
-
-    isReconciliationRunning = false;
 }
 
-/**
- * Directs inbound network payloads down to local worker threads.
- */
-function handleIncomingMessage(rawData, senderIp, ws) {
-    const message = JSON.parse(rawData.toString());
+// Attach init directly to the instance to allow standard default-import invocation
+socketMeshInstance.init = init;
 
-    if (message.method === 'mesh.orgData' && message.organization_id) {
-        // Incoming real-time transaction from a sibling cluster node.
-        // Dispatch locally to ALL local worker processes hosting active sockets for this organization.
-        const activeWorkerIds = orgWorkers.get(message.organization_id);
-        if (activeWorkerIds && activeWorkerIds.size > 0) {
-            serverCtx.send({
-                method: 'mesh.inbound',
-                workers: Array.from(activeWorkerIds),
-                master: false,
-                data: typeof message.data === 'string' ? message.data : JSON.stringify(message.data)
-            });
-        }
-
-        // Also forward to Master's wsManager in case Master is running in local-connection mode
-        if (serverCtx.wsManager) {
-            serverCtx.wsManager.broadcast(message.data, { isForwarded: true });
-        }
-    } 
-    else if (message.method === 'mesh.orgAdded' && message.organization_id) {
-        // Register subscription state for the remote peer server (Runtime and Handshake sync use this exact block!)
-        registerPeerSubscription(message.serverId || senderIp, message.organization_id);
-    } 
-    else if (message.method === 'mesh.orgDeleted' && message.organization_id) {
-        // Deregister subscription state for the remote peer server
-        deregisterPeerSubscription(message.serverId || senderIp, message.organization_id);
-    } 
-    else {
-        // General Fallback Broadcast
-        serverCtx.send({
-            method: 'mesh.inbound',
-            broadcast: true,
-            master: false,
-            data: rawData.toString()
-        });
-        if (serverCtx.wsManager) {
-            serverCtx.wsManager.broadcast(rawData, { isForwarded: true });
-        }
-    }
-}
-
-/**
- * Public network broadcast interface.
- */
-export function send(payload) {
-    const isPrimary = serverCtx.isPrimary;
-
-    // Route upstream through Master process if called inside a Worker thread
-    if (!isPrimary) {
-        serverCtx.send({
-            method: 'mesh.outbound',
-            master: true,
-            data: typeof payload === 'string' ? payload : JSON.stringify(payload)
-        });
-        return;
-    }
-
-    // Direct network broadcast to all peer nodes
-    const dataStr = typeof payload === 'string' ? payload : JSON.stringify(payload);
-    for (const ws of activeConnections.values()) {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(dataStr);
-        }
-    }
-}
-
-export default {
-    init,
-    send
-};
+// Default export matches standard functional entry contract
+export default socketMeshInstance;
