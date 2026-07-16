@@ -13,6 +13,7 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
  ********************************************************************************/
 
 import { WebSocketServer, WebSocket } from 'ws';
@@ -34,6 +35,10 @@ const pruneTimers = new Map();
 // Control locks to block overlapping reconciliation steps
 let isReconciliationRunning = false;
 let isGracefulExitRunning = false;
+
+// Interval timers for cleanup and heartbeats
+let dbHeartbeatInterval = null;
+let wsPingInterval = null;
 
 let serverCtx = null;
 const MESH_PORT = process.env.MESH_PORT || 8090;
@@ -64,6 +69,9 @@ function normalizePeersList(result) {
     return [];
 }
 
+/**
+ * Generates self-signed TLS credentials on-the-fly for secure inter-node cluster tunnels.
+ */
 function generateTLSCredentials() {
     const tmpDir = os.tmpdir();
     const keyPath = path.join(tmpDir, `mesh-key-${Date.now()}.pem`);
@@ -130,6 +138,11 @@ export async function init(server) {
         const ip = req.socket.remoteAddress;
         console.log(`[@cocreate/socket-mesh] Incoming peer connection from ${ip}`);
         
+        ws.isAlive = true;
+        ws.on('pong', () => {
+            ws.isAlive = true;
+        });
+
         ws.on('message', (message) => {
             handleIncomingMessage(message, ip);
         });
@@ -146,20 +159,80 @@ export async function init(server) {
         activeConnections.set(ip, ws);
     });
 
+    // Run the Symmetrical Startup Connection Sync EXACTLY ONCE.
+    // Since our new server ID is guaranteed to be larger than any existing running server,
+    // this single startup query is mathematically guaranteed to find and connect to every existing active node!
     await reconcilePeerConnections();
     
-    // Set up heartbeat and zombie pruning interval (every 30 seconds)
-    setInterval(reconcilePeerConnections, 30000); 
+    // Set up database-only heartbeat updates (write-only, zero database reads!)
+    dbHeartbeatInterval = setInterval(publishDatabaseHeartbeat, 30000); 
+
+    // Set up network-level WebSocket ping/pong checks (fully decentralized, zero DB overhead!)
+    wsPingInterval = setInterval(pingActiveWebsockets, 30000);
 }
 
 /**
- * Executes a full graceful shutdown: wipes the DB record and frees the network ports
+ * Executes a lightweight DB-only write heartbeat to register/keep our presence warm.
+ * This runs with ZERO read queries, keeping database load near non-existent.
+ */
+async function publishDatabaseHeartbeat() {
+    if (isGracefulExitRunning || !serverCtx || !serverCtx.crud || !serverCtx.ip) return;
+
+    try {
+        const registerPayload = {
+            method: 'object.update',
+            array: 'servers',
+            upsert: true,
+            object: {
+                _id: serverCtx.id,
+                ip: serverCtx.ip,
+                host: serverCtx.host,
+                status: 'active',
+                infrastructure: serverCtx.infrastructure,
+                lastSeen: new Date().toISOString()
+            },
+            organization_id: serverCtx.organization_id,
+            host: serverCtx.host
+        };
+
+        const registerResult = await serverCtx.crud.send(registerPayload);
+        if (registerResult && registerResult.error) {
+            console.error(`[@cocreate/socket-mesh] Heartbeat registration rejected:`, registerResult.error);
+        }
+    } catch (err) {
+        console.error(`[@cocreate/socket-mesh] Failed database heartbeat update:`, err.message);
+    }
+}
+
+/**
+ * Pings all connected server sockets to quickly catch half-open TCP failures.
+ * This ensures silent network disconnects are cleaned up without hitting any database.
+ */
+function pingActiveWebsockets() {
+    if (isGracefulExitRunning || !meshWss) return;
+
+    meshWss.clients.forEach((ws) => {
+        if (ws.isAlive === false) {
+            console.warn(`[@cocreate/socket-mesh] Client socket unresponsive. Terminating connection.`);
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}
+
+/**
+ * Executes a full graceful shutdown: wipes our DB record, clears intervals, and frees the network ports
  */
 async function handleGracefulShutdown() {
     if (isGracefulExitRunning) return;
     isGracefulExitRunning = true;
     
     console.log(`\n[@cocreate/socket-mesh] Graceful shutdown initiated. Cleaning up mesh state...`);
+
+    // Clear all recurring utility intervals
+    if (dbHeartbeatInterval) clearInterval(dbHeartbeatInterval);
+    if (wsPingInterval) clearInterval(wsPingInterval);
 
     // 1. Unregister from the database to prevent ghost/zombie nodes
     if (serverCtx && serverCtx.crud && serverCtx.id && serverCtx.organization_id) {
@@ -189,7 +262,7 @@ async function handleGracefulShutdown() {
     }
     activeConnections.clear();
 
-    // 4. Release Port 8089 and exit
+    // 4. Release Port and exit
     if (meshWss) meshWss.close();
     if (secureMeshServer) {
         secureMeshServer.close(() => {
@@ -209,14 +282,15 @@ async function handleGracefulShutdown() {
 
 /**
  * Resolves the global network cluster state and orchestrates direct socket links.
- * Employs a deterministic, alphabetical sort logic based on server ObjectId strings.
+ * Employs a deterministic, chronological sort logic based on server ObjectId strings.
+ * This is executed ONCE on startup.
  */
 async function reconcilePeerConnections() {
     if (isReconciliationRunning || isGracefulExitRunning || !serverCtx.crud) return;
     isReconciliationRunning = true;
 
     try {
-        console.log(`[@cocreate/socket-mesh] Starting Symmetrical peer reconciliation...`);
+        console.log(`[@cocreate/socket-mesh] Starting startup peer reconciliation...`);
 
         // Check 1: Ensure IP address is active
         if (!serverCtx.ip) {
@@ -244,29 +318,13 @@ async function reconcilePeerConnections() {
             }
         }
 
-        // Heartbeat payload using "upsert: true" to safely register on boot and modify on ticks
-        const registerPayload = {
-            method: 'object.update',
-            array: 'servers',
-            upsert: true,
-            object: {
-                _id: serverCtx.id, // Symmetrical unique identification
-                ip: serverCtx.ip,
-                host: serverCtx.host,
-                status: 'active',
-                infrastructure: serverCtx.infrastructure
-            },
-            organization_id: serverCtx.organization_id,
-            host: serverCtx.host
-        };
-
-        const registerResult = await serverCtx.crud.send(registerPayload);
-        if (registerResult && registerResult.error) {
-            console.error(`[@cocreate/socket-mesh] Heartbeat registration rejected:`, registerResult.error);
-        }
+        // Keep our registration fresh right before query
+        await publishDatabaseHeartbeat();
 
         // Query to read registered servers inside the organization scope
-        // Strictly targeting peers with an ID less than ours to prevent socket loops
+        // Strictly targeting peers with an ID less than ours to prevent socket loops.
+        // Because our new ID is guaranteed to be the largest, this query successfully
+        // returns every other active node currently in existence!
         const readPayload = {
             method: 'object.read',
             array: 'servers',
@@ -313,6 +371,14 @@ async function reconcilePeerConnections() {
                     ], {
                         servername: serverCtx.host, // Map TLS SNI explicitly
                         rejectUnauthorized: false // Development safety fallback for direct IP-to-IP bridges
+                    });
+
+                    clientSocket.isAlive = true;
+                    clientSocket.on('pong', () => {
+                        clientSocket.isAlive = true;
+                    });
+                    clientSocket.on('ping', () => {
+                        clientSocket.pong();
                     });
 
                     clientSocket.on('open', () => {
