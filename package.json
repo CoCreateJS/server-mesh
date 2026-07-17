@@ -1,5 +1,5 @@
 {
-  "name": "@cocreate/socket-mesh",
+  "name": "@cocreate/server-mesh",
   "version": "1.0.0",
   "description": "Pluggable, event-driven WebSocket clustering and P2P mesh driver for CoCreate Server, enabling dynamic server-to-server state synchronization across multi-cloud and bare-metal environments.",
   "keywords": [
@@ -22,14 +22,14 @@
     "test": "echo \"Error: no test specified\" && exit 1"  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CoCreate-app/CoCreate-socket-mesh.git"
+    "url": "git+https://github.com/CoCreate-app/CoCreate-server-mesh.git"
   },
   "author": "CoCreate LLC",
   "license": "AGPL-3.0",
   "bugs": {
-    "url": "https://github.com/CoCreate-app/CoCreate-socket-mesh/issues"
+    "url": "https://github.com/CoCreate-app/CoCreate-server-mesh/issues"
   },
-  "homepage": "https://cocreate.app/docs/CoCreate-socket-mesh",
+  "homepage": "https://cocreate.app/docs/CoCreate-server-mesh",
   "dependencies": {
     "ws": "^8.21.0"
   }

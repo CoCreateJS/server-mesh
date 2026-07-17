@@ -8,13 +8,13 @@ module.exports = {
             "object": {
                 "_id": "6204254580b409001727b744",
                 "name": "index.html",
-                "path": "/docs/socket-mesh",
-                "pathname": "/docs/socket-mesh/index.html",
+                "path": "/docs/server-mesh",
+                "pathname": "/docs/server-mesh/index.html",
                 "src": "{{./docs/index.html}}",
                 "host": [
                     "*"
                 ],
-                "directory": "socket-mesh",
+                "directory": "server-mesh",
                 "content-type": "text/html",
                 "public": "true"
             }

@@ -57,16 +57,16 @@ function socketSend(sockets, data) {
                 socket.send(dataStr);
             }
         } catch (err) {
-            console.error(`[@cocreate/socket-mesh] Error executing socketSend transaction:`, err.message);
+            console.error(`[@cocreate/server-mesh] Error executing socketSend transaction:`, err.message);
         }
     }
 }
 
 /**
- * SocketMesh acts as a pure transport fabric. It blindly dispatches
+ * ServerMesh acts as a pure transport fabric. It blindly dispatches
  * all inbound network payloads as standard EventEmitter events.
  */
-class SocketMesh extends EventEmitter {
+class ServerMesh extends EventEmitter {
     constructor() {
         super();
     }
@@ -79,7 +79,7 @@ class SocketMesh extends EventEmitter {
      */
     send(payload) {
         if (!payload || !payload.method) {
-            console.error("[@cocreate/socket-mesh] [MESH ERROR] Cannot transmit mesh payload without a defined 'method' key.");
+            console.error("[@cocreate/server-mesh] [MESH ERROR] Cannot transmit mesh payload without a defined 'method' key.");
             return;
         }
 
@@ -128,10 +128,10 @@ class SocketMesh extends EventEmitter {
     }
 }
 
-const socketMeshInstance = new SocketMesh();
+const serverMeshInstance = new ServerMesh();
 
 // Listener A: Handle peer registration of an organization subscription
-socketMeshInstance.on('mesh.orgAdded', (message, ws) => {
+serverMeshInstance.on('mesh.orgAdded', (message, ws) => {
     if (!ws) return;
     const organization_id = message.organization_id;
     const ip = ws.remoteAddress || ws._socket?.remoteAddress;
@@ -141,11 +141,11 @@ socketMeshInstance.on('mesh.orgAdded', (message, ws) => {
         orgServers.set(organization_id, new Set());
     }
     orgServers.get(organization_id).add(ws);
-    console.log(`[@cocreate/socket-mesh] Peer ${peerId} registered subscription for org "${organization_id}"`);
+    console.log(`[@cocreate/server-mesh] Peer ${peerId} registered subscription for org "${organization_id}"`);
 });
 
 // Listener B: Handle peer de-registration of an organization subscription
-socketMeshInstance.on('mesh.orgDeleted', (message, ws) => {
+serverMeshInstance.on('mesh.orgDeleted', (message, ws) => {
     if (!ws) return;
     const organization_id = message.organization_id;
     const ip = ws.remoteAddress || ws._socket?.remoteAddress;
@@ -157,12 +157,12 @@ socketMeshInstance.on('mesh.orgDeleted', (message, ws) => {
         if (sockets.size === 0) {
             orgServers.delete(organization_id);
         }
-        console.log(`[@cocreate/socket-mesh] Peer ${peerId} de-registered subscription from org "${organization_id}"`);
+        console.log(`[@cocreate/server-mesh] Peer ${peerId} de-registered subscription from org "${organization_id}"`);
     }
 });
 
 // Listener C: Handle incoming real-time network unicast transaction data
-socketMeshInstance.on('mesh.orgData', (message) => {
+serverMeshInstance.on('mesh.orgData', (message) => {
     const { organization_id, data } = message;
     
     // Local Unicast: Relay directly to local child worker threads hosting this tenant
@@ -176,25 +176,25 @@ socketMeshInstance.on('mesh.orgData', (message) => {
                 data: typeof data === 'string' ? data : JSON.stringify(data)
             });
         } catch (err) {
-            console.error(`[@cocreate/socket-mesh] Failed to relay incoming orgData to workers of org "${organization_id}":`, err.message);
+            console.error(`[@cocreate/server-mesh] Failed to relay incoming orgData to workers of org "${organization_id}":`, err.message);
         }
     }
 });
 
 // Listener D: Handle cluster coordination to cancel DB prune schedules on peer consensus
-socketMeshInstance.on('mesh.peer_pruned', (message) => {
+serverMeshInstance.on('mesh.peer_pruned', (message) => {
     if (message.deadIp) {
         const activeTimerId = pruneTimers.get(message.deadIp);
         if (activeTimerId) {
             clearTimeout(activeTimerId);
             pruneTimers.delete(message.deadIp);
-            console.log(`[@cocreate/socket-mesh] Cancelled DB prune for ${message.deadIp} due to peer consensus.`);
+            console.log(`[@cocreate/server-mesh] Cancelled DB prune for ${message.deadIp} due to peer consensus.`);
         }
     }
 });
 
 // Listener E: Handle fallback of unhandled incoming network packets
-socketMeshInstance.on('mesh.raw_message', (message) => {
+serverMeshInstance.on('mesh.raw_message', (message) => {
     if (serverCtx) {
         try {
             serverCtx.send({
@@ -204,7 +204,7 @@ socketMeshInstance.on('mesh.raw_message', (message) => {
                 data: JSON.stringify(message)
             });
         } catch (err) {
-            console.error("[@cocreate/socket-mesh] Failed to relay raw fallback message to workers:", err.message);
+            console.error("[@cocreate/server-mesh] Failed to relay raw fallback message to workers:", err.message);
         }
     }
 });
@@ -239,7 +239,7 @@ function generateTLSCredentials() {
         
         return { key, cert };
     } catch (err) {
-        console.error('[@cocreate/socket-mesh] Failed to generate ephemeral TLS credentials:', err.message);
+        console.error('[@cocreate/server-mesh] Failed to generate ephemeral TLS credentials:', err.message);
         return null;
     }
 }
@@ -276,7 +276,7 @@ export async function init(server) {
         // Monitor process IPC from Primary
         process.on('message', (message) => {
             if (message && message.method) {
-                socketMeshInstance.emit(message.method, message);
+                serverMeshInstance.emit(message.method, message);
             }
         });
         return;
@@ -296,10 +296,10 @@ export async function init(server) {
                 }
 
                 orgWorkers.get(organization_id).add(workerId);
-                console.log(`[@cocreate/socket-mesh] [LOCAL-MAP] Tenant "${organization_id}" registered on Worker ${workerId}`);
+                console.log(`[@cocreate/server-mesh] [LOCAL-MAP] Tenant "${organization_id}" registered on Worker ${workerId}`);
 
                 if (isNewOrg) {
-                    socketMeshInstance.send({
+                    serverMeshInstance.send({
                         method: 'mesh.orgAdded',
                         organization_id,
                         senderId: serverCtx.id
@@ -314,8 +314,8 @@ export async function init(server) {
                     workersSet.delete(workerId);
                     if (workersSet.size === 0) {
                         orgWorkers.delete(organization_id);
-                        console.log(`[@cocreate/socket-mesh] [LOCAL-MAP] Tenant "${organization_id}" evicted. No remaining local workers.`);
-                        socketMeshInstance.send({
+                        console.log(`[@cocreate/server-mesh] [LOCAL-MAP] Tenant "${organization_id}" evicted. No remaining local workers.`);
+                        serverMeshInstance.send({
                             method: 'mesh.orgDeleted',
                             organization_id,
                             senderId: serverCtx.id
@@ -339,7 +339,7 @@ export async function init(server) {
                                 data: typeof data === 'string' ? data : JSON.stringify(data)
                             });
                         } catch (err) {
-                            console.error("[@cocreate/socket-mesh] Failed to propagate orgData to local siblings:", err.message);
+                            console.error("[@cocreate/server-mesh] Failed to propagate orgData to local siblings:", err.message);
                         }
                     }
                 }
@@ -358,12 +358,12 @@ export async function init(server) {
             else if (message.method === 'mesh.outbound_mesh_relay') {
                 // Relay child worker message out to peer nodes
                 if (message.payload) {
-                    socketMeshInstance.send(message.payload);
+                    serverMeshInstance.send(message.payload);
                 }
             }
             
             // Mirror all incoming process IPC commands to local listeners
-            socketMeshInstance.emit(message.method, message, workerRef);
+            serverMeshInstance.emit(message.method, message, workerRef);
         }
     });
 
@@ -373,15 +373,15 @@ export async function init(server) {
         secureMeshServer = https.createServer(credentials);
         secureMeshServer.on('error', (err) => {
             if (err.code === 'EADDRINUSE') {
-                console.error(`\n[@cocreate/socket-mesh] [FATAL] Port ${MESH_PORT} is already in use!`);
+                console.error(`\n[@cocreate/server-mesh] [FATAL] Port ${MESH_PORT} is already in use!`);
                 process.exit(1);
             } else {
-                console.error(`[@cocreate/socket-mesh] Mesh server error:`, err);
+                console.error(`[@cocreate/server-mesh] Mesh server error:`, err);
             }
         });
 
         secureMeshServer.listen(MESH_PORT, '0.0.0.0', () => {
-            console.log(`[@cocreate/socket-mesh] Mesh securely listening on 0.0.0.0:${MESH_PORT}`);
+            console.log(`[@cocreate/server-mesh] Mesh securely listening on 0.0.0.0:${MESH_PORT}`);
         });
     } else {
         throw new Error("Unable to boot secure mesh: TLS credential generation failed.");
@@ -404,7 +404,7 @@ export async function init(server) {
         }
 
         const identifier = remoteServerId || ip;
-        console.log(`[@cocreate/socket-mesh] Secure peer connection established: ${identifier}`);
+        console.log(`[@cocreate/server-mesh] Secure peer connection established: ${identifier}`);
         
         ws.isAlive = true;
         ws.on('pong', () => { ws.isAlive = true; });
@@ -414,7 +414,7 @@ export async function init(server) {
             try {
                 const message = JSON.parse(rawData.toString());
                 if (message && message.method) {
-                    socketMeshInstance.emit(message.method, message, ws);
+                    serverMeshInstance.emit(message.method, message, ws);
                 }
             } catch (err) {
                 // Safely catch parsing failures
@@ -422,14 +422,14 @@ export async function init(server) {
         });
 
         ws.on('close', () => {
-            console.log(`[@cocreate/socket-mesh] Peer connection ${identifier} dropped.`);
+            console.log(`[@cocreate/server-mesh] Peer connection ${identifier} dropped.`);
             activeConnections.delete(identifier);
             if (remoteServerId) activeConnections.delete(ip);
             removeSocketFromAllOrgServers(ws);
         });
         
         ws.on('error', (err) => {
-            console.error(`[@cocreate/socket-mesh] Connection error (${identifier}):`, err.message);
+            console.error(`[@cocreate/server-mesh] Connection error (${identifier}):`, err.message);
         });
         
         activeConnections.set(identifier, ws);
@@ -439,7 +439,7 @@ export async function init(server) {
     try {
         await getServers();
     } catch (err) {
-        console.error("[@cocreate/socket-mesh] Peer discovery reconciliation cycle failed on start:", err.message);
+        console.error("[@cocreate/server-mesh] Peer discovery reconciliation cycle failed on start:", err.message);
     }
     
     wsPingInterval = setInterval(pingActiveWebsockets, 30000);
@@ -470,12 +470,12 @@ async function registerServer() {
     try {
         const registerResult = await serverCtx.crud.send(registerPayload);
         if (registerResult && registerResult.error) {
-            console.error(`[@cocreate/socket-mesh] Startup registration rejected: ${JSON.stringify(registerResult.error)}`);
+            console.error(`[@cocreate/server-mesh] Startup registration rejected: ${JSON.stringify(registerResult.error)}`);
         } else {
-            console.log(`[@cocreate/socket-mesh] Successfully registered server profile in db.`);
+            console.log(`[@cocreate/server-mesh] Successfully registered server profile in db.`);
         }
     } catch (err) {
-        console.error("[@cocreate/socket-mesh] Startup registration network error:", err.message);
+        console.error("[@cocreate/server-mesh] Startup registration network error:", err.message);
     }
 }
 
@@ -487,14 +487,14 @@ function pingActiveWebsockets() {
 
     meshWss.clients.forEach((ws) => {
         if (ws.isAlive === false) {
-            console.warn(`[@cocreate/socket-mesh] Client socket unresponsive. Terminating connection.`);
+            console.warn(`[@cocreate/server-mesh] Client socket unresponsive. Terminating connection.`);
             return ws.terminate();
         }
         ws.isAlive = false;
         try {
             ws.ping();
         } catch (err) {
-            console.error("[@cocreate/socket-mesh] Error during websocket ping:", err.message);
+            console.error("[@cocreate/server-mesh] Error during websocket ping:", err.message);
         }
     });
 }
@@ -506,7 +506,7 @@ async function handleGracefulShutdown() {
     if (isGracefulExitRunning) return;
     isGracefulExitRunning = true;
     
-    console.log(`\n[@cocreate/socket-mesh] Graceful shutdown initiated. Cleaning up mesh state...`);
+    console.log(`\n[@cocreate/server-mesh] Graceful shutdown initiated. Cleaning up mesh state...`);
 
     clearInterval(wsPingInterval);
 
@@ -519,9 +519,9 @@ async function handleGracefulShutdown() {
                 organization_id: serverCtx.organization_id,
                 host: serverCtx.host
             });
-            console.log(`[@cocreate/socket-mesh] Server record wiped from database.`);
+            console.log(`[@cocreate/server-mesh] Server record wiped from database.`);
         } catch (err) {
-            console.error("[@cocreate/socket-mesh] Failed to wipe server status cleanly from DB:", err.message);
+            console.error("[@cocreate/server-mesh] Failed to wipe server status cleanly from DB:", err.message);
         }
     }
 
@@ -544,7 +544,7 @@ async function handleGracefulShutdown() {
 
     if (secureMeshServer) {
         secureMeshServer.close(() => {
-            console.log(`[@cocreate/socket-mesh] Port ${MESH_PORT} successfully released.`);
+            console.log(`[@cocreate/server-mesh] Port ${MESH_PORT} successfully released.`);
             process.exit(0);
         });
     } else {
@@ -552,7 +552,7 @@ async function handleGracefulShutdown() {
     }
 
     setTimeout(() => {
-        console.warn('[@cocreate/socket-mesh] Force-exiting gracefully hung process.');
+        console.warn('[@cocreate/server-mesh] Force-exiting gracefully hung process.');
         process.exit(1);
     }, 3000).unref();
 }
@@ -577,7 +577,7 @@ async function getServers() {
                 host: serverCtx.host
             });
         } catch (err) {
-            console.warn("[@cocreate/socket-mesh] Startup instance-eviction run failed/skipped:", err.message);
+            console.warn("[@cocreate/server-mesh] Startup instance-eviction run failed/skipped:", err.message);
         }
     }
 
@@ -600,7 +600,7 @@ async function getServers() {
     try {
         readResult = await serverCtx.crud.send(readPayload);
     } catch (err) {
-        console.error("[@cocreate/socket-mesh] Failed to fetch active peer server records:", err.message);
+        console.error("[@cocreate/server-mesh] Failed to fetch active peer server records:", err.message);
         return;
     }
 
@@ -612,7 +612,7 @@ async function getServers() {
         if (targetIp === serverCtx.ip) continue;
         if (activeConnections.has(targetIp)) continue;
 
-        console.log(`[@cocreate/socket-mesh] Initiating secure connection stream to target: ${targetIp}`);
+        console.log(`[@cocreate/server-mesh] Initiating secure connection stream to target: ${targetIp}`);
 
         let retryCount = 0;
         const maxRetries = 10;
@@ -639,7 +639,7 @@ async function getServers() {
             clientSocket.on('ping', () => { clientSocket.pong(); });
 
             clientSocket.on('open', () => {
-                console.log(`[@cocreate/socket-mesh] Secure link complete to peer: ${targetIp}`);
+                console.log(`[@cocreate/server-mesh] Secure link complete to peer: ${targetIp}`);
                 retryCount = 0;
                 
                 if (retryTimers.has(targetIp)) clearTimeout(retryTimers.get(targetIp));
@@ -666,15 +666,15 @@ async function getServers() {
                 if (retryCount < maxRetries) {
                     retryCount++;
                     const delay = 5000 + Math.floor(Math.random() * 2000);
-                    console.warn(`[@cocreate/socket-mesh] Peer disconnected. Retrying in ${delay}ms...`);
+                    console.warn(`[@cocreate/server-mesh] Peer disconnected. Retrying in ${delay}ms...`);
                     const timerId = setTimeout(connectToPeer, delay);
                     retryTimers.set(targetIp, timerId);
                 } else {
                     const staggerDelay = peers.length * 1000;
-                    console.warn(`[@cocreate/socket-mesh] Peer dead. Scheduling db prune in ${staggerDelay}ms...`);
+                    console.warn(`[@cocreate/server-mesh] Peer dead. Scheduling db prune in ${staggerDelay}ms...`);
                     
                     const pruneTimerId = setTimeout(async () => {
-                        console.error(`[@cocreate/socket-mesh] Pruning unresponsive node: ${targetIp}`);
+                        console.error(`[@cocreate/server-mesh] Pruning unresponsive node: ${targetIp}`);
                         
                         try {
                             await serverCtx.crud.send({
@@ -685,11 +685,11 @@ async function getServers() {
                                 host: serverCtx.host
                             });
                         } catch (err) {
-                            console.error(`[@cocreate/socket-mesh] Failed to prune node ${targetIp} from database:`, err.message);
+                            console.error(`[@cocreate/server-mesh] Failed to prune node ${targetIp} from database:`, err.message);
                         }
                         
                         // Symmetrical Consensus Broadcast: Emits with standard uuid tracking
-                        socketMeshInstance.send({
+                        serverMeshInstance.send({
                             method: 'mesh.peer_pruned',
                             deadIp: targetIp,
                             isForwarded: true,
@@ -708,7 +708,7 @@ async function getServers() {
                 try {
                     const message = JSON.parse(rawData.toString());
                     if (message && message.method) {
-                        socketMeshInstance.emit(message.method, message, clientSocket);
+                        serverMeshInstance.emit(message.method, message, clientSocket);
                     }
                 } catch (err) {
                     // Safely catch parsing failures
@@ -716,7 +716,7 @@ async function getServers() {
             });
 
             clientSocket.on('error', (err) => {
-                console.log(`[@cocreate/socket-mesh] Socket transport failure: ${err.message}`);
+                console.log(`[@cocreate/server-mesh] Socket transport failure: ${err.message}`);
             });
         };
 
@@ -725,7 +725,7 @@ async function getServers() {
 }
 
 // Attach init directly to the instance to allow standard default-import invocation
-socketMeshInstance.init = init;
+serverMeshInstance.init = init;
 
 // Default export matches standard functional entry contract
-export default socketMeshInstance;
+export default serverMeshInstance;
