@@ -1,6 +1,6 @@
 {
   "name": "@cocreate/server-mesh",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Pluggable, event-driven WebSocket clustering and P2P mesh driver for CoCreate Server, enabling dynamic server-to-server state synchronization across multi-cloud and bare-metal environments.",
   "keywords": [
     "cocreate-socket",
@@ -19,7 +19,8 @@
   "main": "./src/index.js",
   "scripts": {
     "demo": "PORT=5000 node demo/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"  },
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/CoCreate-app/CoCreate-server-mesh.git"
