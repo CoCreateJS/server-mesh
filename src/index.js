@@ -126,6 +126,14 @@ class ServerMesh extends EventEmitter {
             socketSend(uniqueSockets, payload);
         }
     }
+
+    /**
+     * Coordinates the graceful shutdown sequence. Called directly from the Master server class.
+     * @returns {Promise<void>} Resolves when all connections have dropped and port binds are freed
+     */
+    async close() {
+        return closeMesh();
+    }
 }
 
 const serverMeshInstance = new ServerMesh();
@@ -265,9 +273,6 @@ function removeSocketFromAllOrgServers(ws) {
  */
 export async function init(server) {
     serverCtx = server;
-
-    process.on('SIGINT', handleGracefulShutdown);
-    process.on('SIGTERM', handleGracefulShutdown);
 
     const isPrimary = serverCtx.isPrimary;
 
@@ -445,17 +450,32 @@ export async function init(server) {
     wsPingInterval = setInterval(pingActiveWebsockets, 30000);
 }
 
-
 /**
  * Registers this server instance once on startup to allow discovery.
  */
 async function registerServer() {
     if (isGracefulExitRunning || !serverCtx?.crud) return;
+    const instanceId = serverCtx.infrastructure?.instanceId;
+    if (instanceId) {
+        try {
+            await serverCtx.crud.send({
+                method: 'object.delete',
+                array: 'servers',
+                $filter: {
+                    query: { 'infrastructure.instanceId': instanceId },
+                    limit: 0
+                },
+                organization_id: serverCtx.organization_id,
+                host: serverCtx.host
+            });
+        } catch (err) {
+            console.warn("[@cocreate/server-mesh] Startup instance-eviction run failed/skipped:", err.message);
+        }
+    }
 
     const registerPayload = {
-        method: 'object.update',
+        method: 'object.create',
         array: 'servers',
-        upsert: true,
         object: {
             _id: serverCtx.id,
             ip: serverCtx.ip,
@@ -501,12 +521,14 @@ function pingActiveWebsockets() {
 
 /**
  * Cleanly handles node evictions and releases network bindings.
+ * Rewritten to support fully coordinated async invocation from Primary Server controller without process.exit
+ * @returns {Promise<void>} Resolves when the HTTPS mesh server port is successfully released.
  */
-async function handleGracefulShutdown() {
+async function closeMesh() {
     if (isGracefulExitRunning) return;
     isGracefulExitRunning = true;
     
-    console.log(`\n[@cocreate/server-mesh] Graceful shutdown initiated. Cleaning up mesh state...`);
+    console.log(`[@cocreate/server-mesh] Coordinated secure mesh shutdown triggered. Evicting state...`);
 
     clearInterval(wsPingInterval);
 
@@ -542,19 +564,16 @@ async function handleGracefulShutdown() {
         try { meshWss.close(); } catch {}
     }
 
-    if (secureMeshServer) {
-        secureMeshServer.close(() => {
-            console.log(`[@cocreate/server-mesh] Port ${MESH_PORT} successfully released.`);
-            process.exit(0);
-        });
-    } else {
-        process.exit(0);
-    }
-
-    setTimeout(() => {
-        console.warn('[@cocreate/server-mesh] Force-exiting gracefully hung process.');
-        process.exit(1);
-    }, 3000).unref();
+    return new Promise((resolve) => {
+        if (secureMeshServer) {
+            secureMeshServer.close(() => {
+                console.log(`[@cocreate/server-mesh] Secure inter-node port ${MESH_PORT} successfully released.`);
+                resolve();
+            });
+        } else {
+            resolve();
+        }
+    });
 }
 
 /**
@@ -562,24 +581,6 @@ async function handleGracefulShutdown() {
  */
 async function getServers() {
     if (isGracefulExitRunning || !serverCtx?.crud) return;
-
-    const instanceId = serverCtx.infrastructure?.instanceId;
-    if (instanceId) {
-        try {
-            await serverCtx.crud.send({
-                method: 'object.delete',
-                array: 'servers',
-                $filter: {
-                    query: { 'infrastructure.instanceId': instanceId },
-                    limit: 0
-                },
-                organization_id: serverCtx.organization_id,
-                host: serverCtx.host
-            });
-        } catch (err) {
-            console.warn("[@cocreate/server-mesh] Startup instance-eviction run failed/skipped:", err.message);
-        }
-    }
 
     // Register profile once on boot
     await registerServer();
