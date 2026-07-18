@@ -1,6 +1,6 @@
 {
   "name": "@cocreate/server-mesh",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Pluggable, event-driven WebSocket clustering and P2P mesh driver for CoCreate Server, enabling dynamic server-to-server state synchronization across multi-cloud and bare-metal environments.",
   "keywords": [
     "cocreate-socket",

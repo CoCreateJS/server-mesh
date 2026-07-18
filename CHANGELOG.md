@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/CoCreate-app/CoCreate-server-mesh/compare/v1.1.0...v1.2.0) (2026-07-18)
+
+
+### Features
+
+* implement coordinated graceful shutdown and improve server instance eviction handling ([c667b53](https://github.com/CoCreate-app/CoCreate-server-mesh/commit/c667b53d1519c50bb7d4f0a9f78657fc6fefbd56))
+
 # [1.1.0](https://github.com/CoCreate-app/CoCreate-server-mesh/compare/v1.0.0...v1.1.0) (2026-07-17)
 
 
