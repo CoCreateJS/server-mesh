@@ -1,16 +1,20 @@
 {
   "name": "@cocreate/server-mesh",
   "version": "1.2.1",
-  "description": "Pluggable, event-driven WebSocket clustering and P2P mesh driver for CoCreate Server, enabling dynamic server-to-server state synchronization across multi-cloud and bare-metal environments.",
+  "description": "Decentralized, event-driven P2P server mesh and transport fabric for CoCreate Server. Optimizes multi-tenant cluster concurrency with dynamic, tenant-isolated WebSocket data tunnels.",
   "keywords": [
-    "cocreate-socket",
-    "low-code",
-    "realtime",
-    "realtime-framework",
-    "collaboration",
-    "shared-editing",
-    "html5-framework",
-    "javascript-framework"
+    "cocreate",
+    "cocreate-server",
+    "websocket-clustering",
+    "p2p-mesh",
+    "multi-tenancy",
+    "realtime-collaboration",
+    "state-synchronization",
+    "distributed-systems",
+    "service-mesh",
+    "headless-server",
+    "crdt",
+    "zero-dependency"
   ],
   "publishConfig": {
     "access": "public"
