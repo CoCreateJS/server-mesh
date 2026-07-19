@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/CoCreate-app/CoCreate-server-mesh/compare/v1.2.0...v1.2.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* set default branch to main ([50a0548](https://github.com/CoCreate-app/CoCreate-server-mesh/commit/50a054846d72ca79bb564aaf2546257c41f62051))
+
 # [1.2.0](https://github.com/CoCreate-app/CoCreate-server-mesh/compare/v1.1.0...v1.2.0) (2026-07-18)
 
 
