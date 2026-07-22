@@ -101,29 +101,76 @@ class ServerMesh extends EventEmitter {
         } else {
             // Master Process: Determine target sockets dynamically based on payload directives
             const targets = [];
+            let routeToWorkersLocally = false;
+            let routeToNetworkPeers = false;
 
-            if (payload.broadcast === true || !payload.servers) {
-                // Symmetrical Cluster Broadcast: Gather all active socket tunnels
-                targets.push(...activeConnections.values());
+            // Determine routing scope
+            if (payload.broadcast === true) {
+                 routeToWorkersLocally = true;
+                 routeToNetworkPeers = true;
             } else {
-                // Multicast/Unicast Routing: Handle polymorphic servers filter (single string or array)
-                const serversList = Array.isArray(payload.servers) 
-                    ? payload.servers 
-                    : [payload.servers];
+                 if (payload.workers) {
+                     routeToWorkersLocally = true;
+                 }
+                 if (payload.servers) {
+                     routeToNetworkPeers = true;
+                 }
+                 // If neither workers nor servers is specified, and it's not a broadcast,
+                 // default to routing to peers (legacy behavior fallback) or perhaps it's misconfigured.
+                 // We'll assume it meant to go out if it reached here without specific local targeting.
+                 if (!payload.workers && !payload.servers) {
+                      routeToNetworkPeers = true;
+                 }
+            }
 
-                for (const id of serversList) {
-                    const socket = activeConnections.get(id);
-                    if (socket) {
-                        targets.push(socket);
-                    }
+            if (routeToWorkersLocally && serverCtx) {
+                // Prevent infinite loops if the message originated from a worker and was just relayed up
+                // The 'senderWorkerId' check usually handles this in IPC, but we explicitly use serverCtx.send
+                try {
+                     // Pass the original payload, serverCtx.send handles 'broadcast' and 'worker' arrays
+                     // We construct a specific IPC payload for local workers
+                     const localIpcPayload = {
+                         method: 'mesh.inbound', // Standardize local delivery method
+                         data: typeof payload === 'string' ? payload : JSON.stringify(payload),
+                         master: false // Prevent master from re-emitting to itself if intended for workers
+                     };
+
+                     if (payload.broadcast === true) {
+                         localIpcPayload.broadcast = true;
+                     } else if (payload.workers) {
+                         localIpcPayload.worker = payload.workers;
+                     }
+
+                     serverCtx.send(localIpcPayload);
+                } catch (err) {
+                     console.error(`[@cocreate/server-mesh] Failed to relay outgoing payload locally:`, err.message);
                 }
             }
 
-            // Deduplicate target sockets since activeConnections maps both serverId and IP to the same socket
-            const uniqueSockets = Array.from(new Set(targets));
-            
-            // Dispatch safely using standard wrapper loop
-            socketSend(uniqueSockets, payload);
+            if (routeToNetworkPeers) {
+                 if (payload.broadcast === true || !payload.servers) {
+                     // Symmetrical Cluster Broadcast: Gather all active socket tunnels
+                     targets.push(...activeConnections.values());
+                 } else {
+                     // Multicast/Unicast Routing: Handle polymorphic servers filter (single string or array)
+                     const serversList = Array.isArray(payload.servers) 
+                         ? payload.servers 
+                         : [payload.servers];
+
+                     for (const id of serversList) {
+                         const socket = activeConnections.get(id);
+                         if (socket) {
+                             targets.push(socket);
+                         }
+                     }
+                 }
+
+                 // Deduplicate target sockets since activeConnections maps both serverId and IP to the same socket
+                 const uniqueSockets = Array.from(new Set(targets));
+                 
+                 // Dispatch safely using standard wrapper loop
+                 socketSend(uniqueSockets, payload);
+            }
         }
     }
 
