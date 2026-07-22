@@ -26,9 +26,8 @@ import { execSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
 
-const activeConnections = new Map();     // serverId/IP -> WebSocket P2P tunnels
-const retryTimers = new Map();           // peerIp -> Timeout ID
-const pruneTimers = new Map();           // peerIp -> Timeout ID
+const activeConnections = new Map();     // server_id -> WebSocket P2P tunnels
+const retryTimers = new Map();           // server_id -> Timeout ID
 const orgWorkers = new Map();            // organization_id -> Set(workerId)
 const orgServers = new Map();            // organization_id -> Set(WebSocket)
 
@@ -104,41 +103,40 @@ class ServerMesh extends EventEmitter {
             let routeToWorkersLocally = false;
             let routeToNetworkPeers = false;
 
+            // Target key: server (polymorphic: single string server ID or array of string server IDs)
+            const targetServers = payload.server;
+            const targetWorkers = payload.workers || payload.worker;
+
             // Determine routing scope
             if (payload.broadcast === true) {
                  routeToWorkersLocally = true;
                  routeToNetworkPeers = true;
             } else {
-                 if (payload.workers) {
+                 if (targetWorkers) {
                      routeToWorkersLocally = true;
                  }
-                 if (payload.servers) {
+                 if (targetServers) {
                      routeToNetworkPeers = true;
                  }
-                 // If neither workers nor servers is specified, and it's not a broadcast,
-                 // default to routing to peers (legacy behavior fallback) or perhaps it's misconfigured.
-                 // We'll assume it meant to go out if it reached here without specific local targeting.
-                 if (!payload.workers && !payload.servers) {
+                 // If neither workers nor server is specified and not broadcast, default to peers
+                 if (!targetWorkers && !targetServers) {
                       routeToNetworkPeers = true;
                  }
             }
 
             if (routeToWorkersLocally && serverCtx) {
                 // Prevent infinite loops if the message originated from a worker and was just relayed up
-                // The 'senderWorkerId' check usually handles this in IPC, but we explicitly use serverCtx.send
                 try {
-                     // Pass the original payload, serverCtx.send handles 'broadcast' and 'worker' arrays
-                     // We construct a specific IPC payload for local workers
                      const localIpcPayload = {
                          method: 'mesh.inbound', // Standardize local delivery method
                          data: typeof payload === 'string' ? payload : JSON.stringify(payload),
-                         master: false // Prevent master from re-emitting to itself if intended for workers
+                         master: false
                      };
 
                      if (payload.broadcast === true) {
                          localIpcPayload.broadcast = true;
-                     } else if (payload.workers) {
-                         localIpcPayload.worker = payload.workers;
+                     } else if (targetWorkers) {
+                         localIpcPayload.worker = targetWorkers;
                      }
 
                      serverCtx.send(localIpcPayload);
@@ -148,14 +146,14 @@ class ServerMesh extends EventEmitter {
             }
 
             if (routeToNetworkPeers) {
-                 if (payload.broadcast === true || !payload.servers) {
+                 if (payload.broadcast === true || !targetServers) {
                      // Symmetrical Cluster Broadcast: Gather all active socket tunnels
                      targets.push(...activeConnections.values());
                  } else {
-                     // Multicast/Unicast Routing: Handle polymorphic servers filter (single string or array)
-                     const serversList = Array.isArray(payload.servers) 
-                         ? payload.servers 
-                         : [payload.servers];
+                     // Multicast/Unicast Routing: Handle polymorphic servers filter (single string or array of Server IDs)
+                     const serversList = Array.isArray(targetServers) 
+                         ? targetServers 
+                         : [targetServers];
 
                      for (const id of serversList) {
                          const socket = activeConnections.get(id);
@@ -165,7 +163,7 @@ class ServerMesh extends EventEmitter {
                      }
                  }
 
-                 // Deduplicate target sockets since activeConnections maps both serverId and IP to the same socket
+                 // Deduplicate target sockets
                  const uniqueSockets = Array.from(new Set(targets));
                  
                  // Dispatch safely using standard wrapper loop
@@ -189,22 +187,20 @@ const serverMeshInstance = new ServerMesh();
 serverMeshInstance.on('mesh.orgAdded', (message, ws) => {
     if (!ws) return;
     const organization_id = message.organization_id;
-    const ip = ws.remoteAddress || ws._socket?.remoteAddress;
-    const peerId = message.senderId || ip;
+    const peerId = message.senderId || ws.peerId;
 
     if (!orgServers.has(organization_id)) {
         orgServers.set(organization_id, new Set());
     }
     orgServers.get(organization_id).add(ws);
-    console.log(`[@cocreate/server-mesh] Peer ${peerId} registered subscription for org "${organization_id}"`);
+    console.log(`[@cocreate/server-mesh] Server ${peerId} registered subscription for org "${organization_id}"`);
 });
 
 // Listener B: Handle peer de-registration of an organization subscription
 serverMeshInstance.on('mesh.orgDeleted', (message, ws) => {
     if (!ws) return;
     const organization_id = message.organization_id;
-    const ip = ws.remoteAddress || ws._socket?.remoteAddress;
-    const peerId = message.senderId || ip;
+    const peerId = message.senderId || ws.peerId;
 
     const sockets = orgServers.get(organization_id);
     if (sockets) {
@@ -212,7 +208,7 @@ serverMeshInstance.on('mesh.orgDeleted', (message, ws) => {
         if (sockets.size === 0) {
             orgServers.delete(organization_id);
         }
-        console.log(`[@cocreate/server-mesh] Peer ${peerId} de-registered subscription from org "${organization_id}"`);
+        console.log(`[@cocreate/server-mesh] Server ${peerId} de-registered subscription from org "${organization_id}"`);
     }
 });
 
@@ -236,19 +232,7 @@ serverMeshInstance.on('mesh.orgData', (message) => {
     }
 });
 
-// Listener D: Handle cluster coordination to cancel DB prune schedules on peer consensus
-serverMeshInstance.on('mesh.peer_pruned', (message) => {
-    if (message.deadIp) {
-        const activeTimerId = pruneTimers.get(message.deadIp);
-        if (activeTimerId) {
-            clearTimeout(activeTimerId);
-            pruneTimers.delete(message.deadIp);
-            console.log(`[@cocreate/server-mesh] Cancelled DB prune for ${message.deadIp} due to peer consensus.`);
-        }
-    }
-});
-
-// Listener E: Handle fallback of unhandled incoming network packets
+// Listener D: Handle fallback of unhandled incoming network packets
 serverMeshInstance.on('mesh.raw_message', (message) => {
     if (serverCtx) {
         try {
@@ -455,9 +439,15 @@ export async function init(server) {
             }
         }
 
-        const identifier = remoteServerId || ip;
-        console.log(`[@cocreate/server-mesh] Secure peer connection established: ${identifier}`);
+        if (!remoteServerId) {
+            console.warn(`[@cocreate/server-mesh] Rejecting inbound mesh connection from ${ip}: Missing Server ID in protocol header.`);
+            ws.close();
+            return;
+        }
+
+        console.log(`[@cocreate/server-mesh] Secure peer connection established: Server ID ${remoteServerId} (IP: ${ip})`);
         
+        ws.peerId = remoteServerId;
         ws.isAlive = true;
         ws.on('pong', () => { ws.isAlive = true; });
 
@@ -474,18 +464,16 @@ export async function init(server) {
         });
 
         ws.on('close', () => {
-            console.log(`[@cocreate/server-mesh] Peer connection ${identifier} dropped.`);
-            activeConnections.delete(identifier);
-            if (remoteServerId) activeConnections.delete(ip);
+            console.log(`[@cocreate/server-mesh] Peer connection ${ws.peerId} dropped.`);
+            activeConnections.delete(ws.peerId);
             removeSocketFromAllOrgServers(ws);
         });
         
         ws.on('error', (err) => {
-            console.error(`[@cocreate/server-mesh] Connection error (${identifier}):`, err.message);
+            console.error(`[@cocreate/server-mesh] Connection error (Server ${ws.peerId}):`, err.message);
         });
         
-        activeConnections.set(identifier, ws);
-        if (remoteServerId) activeConnections.set(ip, ws);
+        activeConnections.set(remoteServerId, ws);
     });
 
     try {
@@ -502,26 +490,9 @@ export async function init(server) {
  */
 async function registerServer() {
     if (isGracefulExitRunning || !serverCtx?.crud) return;
-    const instanceId = serverCtx.infrastructure?.instanceId;
-    if (instanceId) {
-        try {
-            await serverCtx.crud.send({
-                method: 'object.delete',
-                array: 'servers',
-                $filter: {
-                    query: { 'infrastructure.instanceId': instanceId },
-                    limit: 0
-                },
-                organization_id: serverCtx.organization_id,
-                host: serverCtx.host
-            });
-        } catch (err) {
-            console.warn("[@cocreate/server-mesh] Startup instance-eviction run failed/skipped:", err.message);
-        }
-    }
 
     const registerPayload = {
-        method: 'object.create',
+        method: 'object.update',
         array: 'servers',
         object: {
             _id: serverCtx.id,
@@ -530,6 +501,7 @@ async function registerServer() {
             status: 'active',
             infrastructure: serverCtx.infrastructure
         },
+        upsert: true,
         organization_id: serverCtx.organization_id,
         host: serverCtx.host
     };
@@ -539,7 +511,7 @@ async function registerServer() {
         if (registerResult && registerResult.error) {
             console.error(`[@cocreate/server-mesh] Startup registration rejected: ${JSON.stringify(registerResult.error)}`);
         } else {
-            console.log(`[@cocreate/server-mesh] [PRIMARY] Successfully registered server profile in db.`);
+            console.log(`[@cocreate/server-mesh] [PRIMARY] Successfully registered/updated server profile in db.`);
         }
     } catch (err) {
         console.error("[@cocreate/server-mesh] Startup registration network error:", err.message);
@@ -582,22 +554,23 @@ async function closeMesh() {
     if (serverCtx?.crud && serverCtx.id && serverCtx.organization_id) {
         try {
             await serverCtx.crud.send({
-                method: 'object.delete',
+                method: 'object.update',
                 array: 'servers',
-                object: { _id: serverCtx.id },
+                object: { 
+                    _id: serverCtx.id,
+                    status: 'inactive'
+                },
                 organization_id: serverCtx.organization_id,
                 host: serverCtx.host
             });
-            console.log(`[@cocreate/server-mesh] Server record wiped from database.`);
+            console.log(`[@cocreate/server-mesh] Server status set to inactive in database.`);
         } catch (err) {
-            console.error("[@cocreate/server-mesh] Failed to wipe server status cleanly from DB:", err.message);
+            console.error("[@cocreate/server-mesh] Failed to update server status cleanly in DB:", err.message);
         }
     }
 
     for (const timerId of retryTimers.values()) clearTimeout(timerId);
-    for (const timerId of pruneTimers.values()) clearTimeout(timerId);
     retryTimers.clear();
-    pruneTimers.clear();
 
     const uniqueSockets = new Set(activeConnections.values());
     for (const ws of uniqueSockets) {
@@ -624,7 +597,21 @@ async function closeMesh() {
 }
 
 /**
- * Scans for peer nodes, establishes direct connections, and schedules lazy prunes.
+ * Calculates exponential backoff delay with a randomized jitter ("blip")
+ * to prevent synchronized thundering-herd reconnection storms across peers.
+ * 
+ * @param {number} attempt - Current retry attempt count
+ * @returns {number} Delay in milliseconds
+ */
+function getJitteredRetryDelay(attempt) {
+    const baseDelay = Math.min(30000, 1000 * Math.pow(1.5, attempt));
+    // Randomized blip between 500ms and 4500ms
+    const blip = Math.floor(Math.random() * 4000) + 500;
+    return baseDelay + blip;
+}
+
+/**
+ * Scans for peer nodes and establishes persistent, self-healing connections with jittered retries.
  */
 async function getServers() {
     if (isGracefulExitRunning || !serverCtx?.crud) return;
@@ -636,7 +623,10 @@ async function getServers() {
         method: 'object.read',
         array: 'servers',
         $filter: {
-            query: { _id: { $lt: serverCtx.id } },
+            query: { 
+                _id: { $ne: serverCtx.id },
+                status: { $ne: 'stopped' }
+            },
             sort: { _id: 1 },
             limit: 0
         },
@@ -655,15 +645,15 @@ async function getServers() {
     const peers = normalizePeersList(readResult);
 
     for (const targetPeer of peers) {
+        const targetId = targetPeer._id;
         const targetIp = targetPeer.ip;
 
-        if (targetIp === serverCtx.ip) continue;
-        if (activeConnections.has(targetIp)) continue;
+        if (!targetId || targetId === serverCtx.id) continue;
+        if (activeConnections.has(targetId) || retryTimers.has(targetId)) continue;
 
-        console.log(`[@cocreate/server-mesh] Initiating secure connection stream to target: ${targetIp}`);
+        console.log(`[@cocreate/server-mesh] Initiating secure connection stream to target Server ID: ${targetId} (IP: ${targetIp})`);
 
         let retryCount = 0;
-        const maxRetries = 10;
 
         const connectToPeer = () => {
             if (isGracefulExitRunning) return; 
@@ -687,68 +677,32 @@ async function getServers() {
             clientSocket.on('ping', () => { clientSocket.pong(); });
 
             clientSocket.on('open', () => {
-                console.log(`[@cocreate/server-mesh] Secure link complete to peer: ${targetIp}`);
+                console.log(`[@cocreate/server-mesh] Secure link complete to Server ID: ${targetId}`);
                 retryCount = 0;
                 
-                if (retryTimers.has(targetIp)) clearTimeout(retryTimers.get(targetIp));
-                if (pruneTimers.has(targetIp)) clearTimeout(pruneTimers.get(targetIp));
-                
-                retryTimers.delete(targetIp);
-                pruneTimers.delete(targetIp);
+                if (retryTimers.has(targetId)) clearTimeout(retryTimers.get(targetId));
+                retryTimers.delete(targetId);
                 
                 clientSocket.isPeer = true;
                 clientSocket.isPlatformTunnel = true;
+                clientSocket.peerId = targetId;
                 
-                activeConnections.set(targetPeer._id, clientSocket);
-                activeConnections.set(targetIp, clientSocket);
+                activeConnections.set(targetId, clientSocket);
             });
 
             clientSocket.on('close', () => {
-                activeConnections.delete(targetPeer._id);
-                activeConnections.delete(targetIp);
-                retryTimers.delete(targetIp);
+                activeConnections.delete(targetId);
+                retryTimers.delete(targetId);
                 removeSocketFromAllOrgServers(clientSocket);
                 
                 if (isGracefulExitRunning) return;
 
-                if (retryCount < maxRetries) {
-                    retryCount++;
-                    const delay = 5000 + Math.floor(Math.random() * 2000);
-                    console.warn(`[@cocreate/server-mesh] Peer disconnected. Retrying in ${delay}ms...`);
-                    const timerId = setTimeout(connectToPeer, delay);
-                    retryTimers.set(targetIp, timerId);
-                } else {
-                    const staggerDelay = peers.length * 1000;
-                    console.warn(`[@cocreate/server-mesh] Peer dead. Scheduling db prune in ${staggerDelay}ms...`);
-                    
-                    const pruneTimerId = setTimeout(async () => {
-                        console.error(`[@cocreate/server-mesh] Pruning unresponsive node: ${targetIp}`);
-                        
-                        try {
-                            await serverCtx.crud.send({
-                                method: 'object.delete',
-                                array: 'servers',
-                                object: { _id: targetPeer._id },
-                                organization_id: serverCtx.organization_id,
-                                host: serverCtx.host
-                            });
-                        } catch (err) {
-                            console.error(`[@cocreate/server-mesh] Failed to prune node ${targetIp} from database:`, err.message);
-                        }
-                        
-                        // Symmetrical Consensus Broadcast: Emits with standard uuid tracking
-                        serverMeshInstance.send({
-                            method: 'mesh.peer_pruned',
-                            deadIp: targetIp,
-                            isForwarded: true,
-                            senderId: serverCtx.id
-                        });
-                        
-                        pruneTimers.delete(targetIp);
-                    }, staggerDelay);
-                    
-                    pruneTimers.set(targetIp, pruneTimerId);
-                }
+                retryCount++;
+                const delay = getJitteredRetryDelay(retryCount);
+                console.warn(`[@cocreate/server-mesh] Peer ${targetId} disconnected. Retrying in ${delay}ms (Attempt #${retryCount})...`);
+                
+                const timerId = setTimeout(connectToPeer, delay);
+                retryTimers.set(targetId, timerId);
             });
 
             // Inlined Blind Event-Dispatch Loop
@@ -764,7 +718,7 @@ async function getServers() {
             });
 
             clientSocket.on('error', (err) => {
-                console.log(`[@cocreate/server-mesh] Socket transport failure: ${err.message}`);
+                console.log(`[@cocreate/server-mesh] Socket transport failure (Server ${targetId}): ${err.message}`);
             });
         };
 

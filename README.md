@@ -1,159 +1,357 @@
-# CoCreate Server Mesh
+````markdown
+# @cocreate/server-mesh
 
-A decentralized, low-latency inter-node communication plane designed to bridge server nodes into a high-speed, peer-to-peer (P2P) cluster federation. This module establishes secure, encrypted data tunnels that facilitate real-time multi-tenant state replication and cross-worker IPC relays with sub-millisecond overhead.
+A high-performance, self-healing, peer-to-peer (P2P) encrypted transport fabric built for distributed cluster orchestration, real-time tenant routing, and inter-node event synchronization across the CoCreate ecosystem.
 
 ---
 
 ## Documentation
 
-For full cluster network topology layouts, routing table configurations, and firewall optimization guides, refer to the [CoCreate Server Mesh Documentation](https://cocreatejs.com/docs/server-mesh).
+For complete API references, deployment guides, and architecture documentation, visit the CoCreate Server Mesh documentation.
 
 ## Table of Contents
 
-* [The Masterless Control Plane Layer](#the-masterless-control-plane-layer)
-* [Why CoCreate Server Mesh?](#why-cocreate-server-mesh)
-* [Dynamic Mesh Network Topology](#dynamic-mesh-network-topology)
-* [The Cluster Quorum Metric](#the-cluster-quorum-metric)
-* [Zero-Copy Payload Bridging](#zero-copy-payload-bridging)
-* [Configuration](#configuration)
-* [Installation](#installation)
-* [Announcements](#announcements)
-* [Roadmap](#roadmap)
-* [How to Contribute](#how-to-contribute)
-* [About](#about)
+- [Overview](#overview)
+- [Key Features](#key-features)
+- [Architecture & Message Pipeline](#architecture--message-pipeline)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Routing Directives & Targeting Matrix](#routing-directives--targeting-matrix)
+- [Tenant-Aware Routing Protocols](#tenant-aware-routing-protocols)
+- [Self-Healing & Reconnection Logic](#self-healing--reconnection-logic)
+- [Programmatic API Reference](#programmatic-api-reference)
+- [Security & TLS Specification](#security--tls-specification)
+- [Environment Variables](#environment-variables)
+- [Announcements](#announcements)
+- [Roadmap](#roadmap)
+- [How to Contribute](#how-to-contribute)
+- [About](#about)
+- [License](#license)
 
 ---
 
-## The Masterless Control Plane Layer
+## Overview
 
-`@cocreate/server-mesh` provides the communication backbone that allows independent servers to operate as a singular, cohesive application cluster. By discarding traditional master-replica routing bottlenecks, the mesh implements an autonomous **Unicast/Broadcast P2P Control Layer**.
+`@cocreate/server-mesh` serves as the real-time inter-server transport plane for `@cocreate/server`. It establishes zero-trust, mutual P2P encrypted WebSocket tunnels between cluster nodes, enabling seamless multi-tenant data propagation, worker thread relays, and distributed cluster command execution.
 
-### Decentralized State Synchronization
-
-Nodes dynamically discover one another using a shared registry database or secure internal network scans. Once a peer is discovered, a persistent, bi-directional WebSocket or TCP stream tunnel is negotiated directly between them, bypassing intermediate proxy bottlenecks.
-
-### Split-Brain Mitigation
-
-The mesh continuously calculates topological state weightings across all surviving peers. If network partitions divide the infrastructure, the disconnected segments use geometric vote counts to selectively cordon themselves, protecting database pools from race conditions or data corruption.
-
-```text
- [Node A] ◄─────────────────── (Bi-Directional P2P Tunnel) ───────────────────► [Node B]
-    │                                                                             │
-    └────────► [Node C] ◄────────────────────────────────────────► [Node D] ──────┘
-```
+Designed as a pure transport fabric, `@cocreate/server-mesh` blindly routes and emits network payloads as standard `EventEmitter` events across the cluster without introducing business-logic overhead.
 
 ---
 
-## Why CoCreate Server Mesh?
+## Key Features
 
-Traditional web clusters rely on a centralized pub/sub redis instance or reverse proxies to route inter-server events (like dispatching a message to a user connected to a different server instance). As connection volume scales, this central message broker inevitably becomes a processing bottleneck and a critical single point of failure (SPOF).
-
-`@cocreate/server-mesh` solves this by connecting nodes directly in a **Fully Connected Mesh Topology**. When a multi-tenant update occurs on Server A that affects users on Server B, the packet travels over a single direct socket hop—drastically slashing message dispatch latencies and completely decoupling the cluster's scaling capabilities from an external broker.
-
----
-
-## Dynamic Mesh Network Topology
-
-The mesh plane handles routing optimization and node membership events across the cluster:
-
-| Network Event | Mesh Plane Action | Operational Result |
-| --- | --- | --- |
-| **Node Join / Boot** | Handshake validation & link broadcast | Instantly introduces the new node to all active peers, expanding routing capacity. |
-| **Unicast Event Route** | Target ID verification via internal routing table | Directly forwards tenant state updates over a single TCP hop to the target instance. |
-| **Broadcast Relay** | Concurrent parallel socket writes | Flushes cluster-wide configuration modifications to all nodes simultaneously. |
-| **Heartbeat Failure** | Auto-prune registry & connection teardown | Isolates dead nodes within 2500ms to preserve cluster connection health. |
+- **Zero-Trust Ephemeral TLS:** Automatically generates temporary TLS credentials for secure node-to-node communication over the mesh network.
+- **Polymorphic Target Directives:** Unicast, multicast, broadcast, worker-specific, or tenant-aware routing using a unified payload format.
+- **Cryptographic Traceability:** Automatically stamps every outgoing frame with a unique `crypto.randomUUID()` identifier for distributed tracing and replay protection.
+- **Tenant Isolation:** Dynamically tracks tenant-to-worker and tenant-to-server mappings so messages are only delivered to nodes actively serving an organization.
+- **Self-Healing Reconnection:** Uses exponential backoff with randomized jitter to prevent reconnection storms after network interruptions.
+- **Cluster IPC Integration:** Transparently bridges Node.js Primary and Worker processes while extending communication across distributed servers.
+- **EventEmitter API:** Receive mesh messages using familiar Node.js event listeners.
 
 ---
 
-## The Cluster Quorum Metric
+## Architecture & Message Pipeline
 
-To safely confirm cluster health and make authorization decisions during topology shifts, the mesh verifies consensus. The minimum required nodes for a healthy cluster partition ($Q_c$) is determined dynamically using the formula:
+When a payload is dispatched through `@cocreate/server-mesh`, the routing engine evaluates execution context (Primary vs Worker), determines the target destination, and forwards the payload through IPC or encrypted peer connections.
 
-$$Q_c = \left\lfloor \frac{N_{\text{total}}}{2} \right\rfloor + 1$$
+$$
+\text{Worker Thread}
+\xrightarrow{\text{IPC}}
+\text{Primary Process}
+\xrightarrow{\text{Route Resolution}}
+\begin{cases}
+\text{Local Workers} \\
+\text{Remote Peer Servers}
+\end{cases}
+$$
 
-Where $N_{\text{total}}$ represents the total number of healthy instances registered within the active mesh control plane. If an isolated partition drops below the $Q_c$ threshold, it goes into defensive fallback mode—refusing local modifications and forcing incoming user traffic to migrate to the dominant partition.
+### Worker Context
 
----
+Worker processes:
 
-## Zero-Copy Payload Bridging
+- Send outbound messages through native `process.send()`
+- Receive inbound mesh traffic through IPC
+- Never establish direct peer connections
 
-Inter-node data bridging can quickly clog memory buses if payloads are constantly parsed and reserialized. `@cocreate/server-mesh` minimizes overhead by utilizing **Stream-Level Piping** and zero-copy binary buffers.
+### Primary Context
 
-When a multi-tenant binary payload or large document packet is received from one node and destined for another, the mesh avoids translating the buffer into high-level JavaScript objects. Instead, the raw internal data streams are directly piped from the source network socket straight into the target peer's outbound stream, maximizing memory bus efficiency.
+The Primary process:
 
----
-
-## Configuration
-
-Drop a `mesh.config.json` into your server root directory to handle discovery protocols, link keys, and cluster boundaries.
-
-```json
-{
-  "clusterName": "cocreate-production-cluster",
-  "port": 8090,
-  "discovery": {
-    "type": "database",
-    "heartbeatIntervalMs": 1000,
-    "missedHeartbeatsLimit": 3
-  },
-  "security": {
-    "encryptionEnabled": true,
-    "algorithm": "aes-256-gcm",
-    "secretKeyEnv": "COCREATE_MESH_SECRET"
-  },
-  "network": {
-    "maxPeers": 64,
-    "connectionTimeoutMs": 5000
-  }
-}
-```
+- Hosts the secure mesh WebSocket server
+- Maintains encrypted peer connections
+- Tracks tenant routing information
+- Routes messages between workers and remote servers
 
 ---
 
 ## Installation
 
-### NPM Installation
+### NPM
 
 ```bash
-npm i @cocreate/server-mesh
+npm install @cocreate/server-mesh
 ```
 
-### Yarn Installation
+### Yarn
 
 ```bash
 yarn add @cocreate/server-mesh
 ```
 
+> **Note**
+>
+> `@cocreate/server-mesh` integrates directly with `@cocreate/server`, but it can also be initialized independently.
+
+---
+
+## Quick Start
+
+### Initialize
+
+```javascript
+import CoCreateServer from "@cocreate/server";
+import ServerMesh from "@cocreate/server-mesh";
+
+await ServerMesh.init(CoCreateServer);
+```
+
+### Send a Message
+
+Unicast to a single server:
+
+```javascript
+ServerMesh.send({
+	method: "cache.flush",
+	server: "srv_64f8a1bc90d1",
+	data: {
+		cache: "users"
+	}
+});
+```
+
+Multicast to multiple servers:
+
+```javascript
+ServerMesh.send({
+	method: "worker.task",
+	server: ["srv_64f8a1bc90d1", "srv_90e3b2ac81f4"],
+	worker: 2,
+	data: {
+		taskId: 1042
+	}
+});
+```
+
+Broadcast to every node:
+
+```javascript
+ServerMesh.send({
+	broadcast: true,
+	method: "reload.configuration"
+});
+```
+
+### Listen for Messages
+
+```javascript
+ServerMesh.on("cache.flush", (message) => {
+	console.log(message.data);
+});
+```
+
+---
+
+## Routing Directives & Targeting Matrix
+
+| Target | Payload | Description |
+| --- | --- | --- |
+| Single Server | `{ server: "srv1" }` | Routes only to the specified server. |
+| Multiple Servers | `{ server: ["srv1","srv2"] }` | Sends to every listed server. |
+| Worker | `{ server: "srv1", worker: 2 }` | Routes to a specific worker on the target server. |
+| Local Workers | `{ worker: [1,3] }` | Sends only to selected local workers. |
+| Broadcast | `{ broadcast: true }` | Delivers to every connected server and local worker. |
+
+---
+
+## Tenant-Aware Routing Protocols
+
+The mesh minimizes unnecessary network traffic by maintaining live organization routing maps.
+
+```text
+Client Connect
+        │
+        ▼
+mesh.registerOrg
+        │
+        ▼
+Map Organization → Worker
+        │
+        ▼
+Client Disconnect
+        │
+        ▼
+60 Second Grace Timer
+        │
+        ▼
+mesh.deregisterOrg
+        │
+        ▼
+mesh.orgDeleted Broadcast
+```
+
+### Organization Events
+
+| Event | Description |
+| --- | --- |
+| `mesh.registerOrg` | Registers a worker serving an organization. |
+| `mesh.deregisterOrg` | Removes a worker's organization mapping after all connections close. |
+| `mesh.orgAdded` | Broadcast to peer servers when an organization becomes active. |
+| `mesh.orgDeleted` | Broadcast when an organization is no longer active on a server. |
+| `mesh.orgData` | Routes organization-specific payloads only to subscribed servers and workers. |
+
+---
+
+## Self-Healing & Reconnection Logic
+
+When peer servers disconnect, reconnection attempts use exponential backoff combined with randomized jitter to prevent synchronized reconnect storms.
+
+$$
+T_{delay}
+=
+\min\left(30000,\,
+1000\times1.5^{attempt}
+\right)
++
+random(500,4500)
+$$
+
+Connections automatically retry until:
+
+- the peer becomes available,
+- the server shuts down,
+- or the connection is intentionally closed.
+
+---
+
+## Programmatic API Reference
+
+### `ServerMesh.init(server)`
+
+Initializes the mesh networking layer.
+
+```javascript
+await ServerMesh.init(server);
+```
+
+---
+
+### `ServerMesh.send(payload)`
+
+Routes a payload across the cluster.
+
+```javascript
+ServerMesh.send({
+	method: "custom.command",
+	server: "srv123",
+	data: {
+		key: "value"
+	}
+});
+```
+
+---
+
+### `ServerMesh.close()`
+
+Gracefully closes all mesh connections and releases resources.
+
+```javascript
+await ServerMesh.close();
+```
+
+---
+
+### Events
+
+```javascript
+ServerMesh.on("mesh.orgAdded", handler);
+
+ServerMesh.on("mesh.orgDeleted", handler);
+
+ServerMesh.on("mesh.orgData", handler);
+
+ServerMesh.on("mesh.raw_message", handler);
+```
+
+---
+
+## Security & TLS Specification
+
+- **Encrypted Transport:** All peer communication occurs over mutually authenticated encrypted WebSocket connections.
+- **Dedicated Mesh Port:** Mesh traffic is isolated from public HTTP and HTTPS traffic.
+- **Ephemeral Certificates:** Temporary TLS certificates are generated during startup and automatically replaced on restart.
+- **Server Authentication:** Incoming peers must successfully complete server identity validation before joining the mesh.
+- **UUID Tracing:** Every transmitted frame receives a unique identifier for distributed tracing and replay protection.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MESH_PORT` | `8090` | Port used for mesh communication. |
+| `CLUSTER_SECRET` | — | Shared secret used during mesh authentication. |
+| `SERVER_ID` | Auto Generated | Persistent identifier for the current server node. |
+
 ---
 
 ## Announcements
 
-Mesh topology optimizations, split-brain algorithm updates, and secure tunnel engine revisions are meticulously detailed in our release notes on the [CoCreate Server Mesh GitHub Releases](https://github.com/CoCreate-app/CoCreate-server-mesh/releases). Subscribe for live tracking.
+Release notes, performance improvements, protocol updates, and networking enhancements are published with every release. Follow the repository to stay informed about new features and compatibility changes.
 
 ---
 
 ## Roadmap
 
-Upcoming foundational developments for our communication plane include:
+Upcoming enhancements include:
 
-* **Native QUIC / HTTP3 Transport:** Migrating inter-node tunnels onto UDP-based QUIC paths to gain superior connection multiplexing and zero head-of-line blocking.
-* **Auto-Discovery Mesh Broadcast:** Seamless local network UDP multicast configurations for zero-config bare metal server clusters.
+- Native QUIC / HTTP/3 transport
+- Adaptive routing based on latency measurements
+- Automatic peer discovery across local networks
+- Streaming binary frame optimizations
+- Dynamic topology-aware routing
 
 ---
 
 ## How to Contribute
 
-We encourage contribution to our libraries (you might even score some nifty swag), please see our [CONTRIBUTING.md](https://github.com/CoCreate-app/CoCreate-server-mesh/blob/master/CONTRIBUTING.md) guide for details. If you encounter any bugs or wish to make feature requests, please submit an issue on our [GitHub Issues](https://github.com/CoCreate-app/CoCreate-server-mesh/issues) tracker. We want this library to be community-driven, and CoCreate led. We need your help to realize this goal.
+We welcome pull requests, bug reports, documentation improvements, performance optimizations, and security reviews.
 
-For broader system configurations and API guides, please visit our [CoCreate Server Mesh Documentation](https://cocreatejs.com/docs/server-mesh).
+Please review the project's `CONTRIBUTING.md` before submitting changes, and use the GitHub Issues page to report bugs or request new features.
+
+Community feedback helps prioritize development and improve the platform.
 
 ---
 
 ## About
 
-`@cocreate/server-mesh` is designed, built, and supported by the CoCreate Developer Experience Team.
+`@cocreate/server-mesh` is designed, built, and maintained by the CoCreate Developer Experience Team.
 
-> [!NOTE]
-> Please contact the Developer Experience Team via [GitHub Discussions](https://github.com/CoCreate-app/CoCreate-server-mesh/discussions) or join our Discord channel for any architecture or deployment queries.
+It serves as the distributed communication backbone of the CoCreate ecosystem, providing secure, low-latency messaging between clustered servers.
 
-`@cocreate/server-mesh` is maintained and funded by CoCreate. The names and logos for CoCreate are trademarks of CoCreate, LLC.
+For questions, architecture discussions, or deployment guidance, visit the project's GitHub Discussions or join the CoCreate community.
+
+---
+
+## License
+
+This software is dual-licensed under the GNU Affero General Public License version 3 (AGPLv3) and a commercial license.
+
+### Open Source
+
+For open-source projects and non-commercial use, this software is available under the AGPLv3. See the `LICENSE` file for the complete license text.
+
+### Commercial
+
+Organizations requiring proprietary use may obtain a commercial license from CoCreate.
+````
