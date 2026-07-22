@@ -73,7 +73,7 @@ class ServerMesh extends EventEmitter {
 
     /**
      * Sends a payload across the secure network mesh.
-     * Automatically appends a unique ID (uid) to guarantee end-to-end tracking.
+     * Automatically appends a unique ID (uuid) to guarantee end-to-end tracking.
      * 
      * @param {Object} payload - Object to transmit containing a required 'method'
      */
@@ -83,9 +83,9 @@ class ServerMesh extends EventEmitter {
             return;
         }
 
-        // Standardize: Every outgoing message must have a unique identifier (uid)
-        if (!payload.uid) {
-            payload.uid = crypto.randomUUID();
+        // Standardize: Every outgoing message must have a unique identifier (uuid)
+        if (!payload.uuid) {
+            payload.uuid = crypto.randomUUID();
         }
 
         const isPrimary = serverCtx?.isPrimary;
@@ -386,7 +386,7 @@ export async function init(server) {
         });
 
         secureMeshServer.listen(MESH_PORT, '0.0.0.0', () => {
-            console.log(`[@cocreate/server-mesh] Mesh securely listening on 0.0.0.0:${MESH_PORT}`);
+            console.log(`[@cocreate/server-mesh] [PRIMARY] Mesh securely listening on 0.0.0.0:${MESH_PORT}`);
         });
     } else {
         throw new Error("Unable to boot secure mesh: TLS credential generation failed.");
@@ -492,7 +492,7 @@ async function registerServer() {
         if (registerResult && registerResult.error) {
             console.error(`[@cocreate/server-mesh] Startup registration rejected: ${JSON.stringify(registerResult.error)}`);
         } else {
-            console.log(`[@cocreate/server-mesh] Successfully registered server profile in db.`);
+            console.log(`[@cocreate/server-mesh] [PRIMARY] Successfully registered server profile in db.`);
         }
     } catch (err) {
         console.error("[@cocreate/server-mesh] Startup registration network error:", err.message);
