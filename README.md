@@ -1,4 +1,3 @@
-````markdown
 # @cocreate/server-mesh
 
 A high-performance, self-healing, peer-to-peer (P2P) encrypted transport fabric built for distributed cluster orchestration, real-time tenant routing, and inter-node event synchronization across the CoCreate ecosystem.
@@ -354,4 +353,3 @@ For open-source projects and non-commercial use, this software is available unde
 ### Commercial
 
 Organizations requiring proprietary use may obtain a commercial license from CoCreate.
-````
