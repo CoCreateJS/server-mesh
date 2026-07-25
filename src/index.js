@@ -6,10 +6,7 @@
  * by the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
+ * This program is distributed in commercials or open source under GNU AGPLv3.
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
@@ -17,32 +14,37 @@
  ********************************************************************************/
 
 import { EventEmitter } from 'node:events';
-import WebSocket from 'ws';
+import crypto from 'node:crypto';
+import { ServerMeshInbound } from './inbound.js';
+import { ServerMeshOutbound } from './outbound.js';
 
 /**
- * ServerMesh manages multi-node peer-to-peer mesh synchronization across server
- * clusters. It routes system commands, node status updates, and broadcast messages
- * directly using server.send and server.on, without relying on Server or process-level checks.
+ * ServerMesh orchestrates multi-tenant routing, unified IPC event forwarding,
+ * shared active connection pools, and coordinates ServerMeshInbound and ServerMeshOutbound.
  */
 export class ServerMesh extends EventEmitter {
     constructor() {
         super();
         this.server = null;
-        this.nodes = new Map(); // Connected peer node WebSocket instances
-        this.peers = new Set(); // Peer server addresses/URLs
-        this.reconnectTimers = new Map();
-        this.heartbeatInterval = null;
-        this.heartbeatMs = 15000;
-        this.isClosed = false;
 
+        // Sub-module transport managers
+        this.inboundManager = new ServerMeshInbound(this);
+        this.outboundManager = new ServerMeshOutbound(this);
+
+        // Shared Connection & Multi-tenant Routing Tables
+        this.activeConnections = new Map(); // serverId / IP -> Network Socket
+        this.orgWorkers = new Map();        // organization_id -> Set(workerId)
+        this.orgServers = new Map();        // organization_id -> Set(Network Socket)
+
+        this.isClosed = false;
         this.handleServerEvent = this.handleServerEvent.bind(this);
     }
 
     /**
-     * Initializes the ServerMesh module with the parent CoCreateServer instance.
-     * Registers system event listeners using server.on and configures mesh command routing.
+     * Initializes the ServerMesh orchestrator with the CoCreateServer instance context.
      * 
-     * @param {Object} server - The CoCreateServer instance
+     * @param {Object} server - CoCreateServer instance
+     * @returns {Promise<ServerMesh>}
      */
     async init(server) {
         if (!server) {
@@ -50,309 +52,383 @@ export class ServerMesh extends EventEmitter {
         }
 
         this.server = server;
+        this.server.mesh = this; // Attach mesh instance directly to server context
         this.isClosed = false;
 
-        // Register core event handlers using server.on
+        // Register IPC listeners on server context
         this.setupServerListeners();
 
-        // Start periodic mesh node heartbeat verification
-        this.startHeartbeat();
+        const isPrimary = this.server.isPrimary ?? true;
 
-        console.log(`[@cocreate/server-mesh] Initialized mesh network layer for server ${this.server.id || 'unassigned'}`);
+        if (!isPrimary) {
+            console.log(`[@cocreate/server-mesh] Initialized mesh layer in worker process context`);
+            return this;
+        }
+
+        // Initialize inbound and outbound sub-modules for Primary node
+        await this.inboundManager.init(this.server);
+        await this.outboundManager.init(this.server);
+
+        console.log(`[@cocreate/server-mesh] Initialized server mesh layer for node ${this.server.id || 'unassigned'}`);
         return this;
     }
 
     /**
-     * Configures event listeners on the server using server.on.
-     * Outbound mesh requests dispatch via mesh.send, while cluster management
-     * commands received across the mesh are forwarded to server.send.
+     * Binds IPC message and broadcasting event handlers to this.server.
      */
     setupServerListeners() {
         if (!this.server || typeof this.server.on !== 'function') return;
 
-        // Listen for internal server requests to broadcast over the mesh
+        // Main unified IPC entry point
+        this.server.on('mesh', (payload) => {
+            this.handleIPCPayload(payload);
+        });
+
+        // Direct mesh dispatch listener
         this.server.on('mesh.send', (payload) => {
             this.send(payload);
         });
 
-        // Listen for cluster administration commands emitted locally or via IPC
-        const systemEvents = ['restart', 'reboot', 'shutdown', 'cordon', 'shed', 'drain'];
-        for (const eventName of systemEvents) {
-            this.server.on(`mesh.${eventName}`, (payload) => {
-                console.log(`[@cocreate/server-mesh] Routing remote mesh command '${eventName}' to server.send`);
-                
-                // Format payload for IPC dispatching
-                const actionPayload = {
-                    ...(payload && typeof payload === 'object' ? payload : {}),
-                    method: eventName
-                };
+        // Register protocol routing logic
+        this.setupProtocolListeners();
+    }
 
-                // Forward command directly into server IPC dispatcher
+    /**
+     * Handles inbound IPC payloads from server.on('mesh').
+     * 
+     * @param {Object} payload - IPC message containing 'method' property
+     */
+    handleIPCPayload(payload) {
+        if (!payload || typeof payload !== 'object' || !payload.method) return;
+
+        const { method } = payload;
+
+        if (method === 'mesh.send' || method === 'mesh.outbound_mesh_relay') {
+            const dataToTransmit = payload.payload ? payload.payload : payload;
+            this.send(dataToTransmit);
+        } 
+        else if (method === 'mesh.registerOrg' || method === 'mesh.orgAdded') {
+            const { organization_id, workerId } = payload;
+            let isNewOrg = false;
+
+            if (!this.orgWorkers.has(organization_id)) {
+                this.orgWorkers.set(organization_id, new Set());
+                isNewOrg = true;
+            }
+
+            if (workerId) {
+                this.orgWorkers.get(organization_id).add(workerId);
+            }
+
+            if (isNewOrg) {
+                this.send({
+                    method: 'mesh.orgAdded',
+                    organization_id,
+                    senderId: this.server.id
+                });
+            }
+        } 
+        else if (method === 'mesh.deregisterOrg' || method === 'mesh.orgDeleted') {
+            const { organization_id, workerId } = payload;
+            const workersSet = this.orgWorkers.get(organization_id);
+
+            if (workersSet) {
+                if (workerId) workersSet.delete(workerId);
+                if (!workerId || workersSet.size === 0) {
+                    this.orgWorkers.delete(organization_id);
+                    this.send({
+                        method: 'mesh.orgDeleted',
+                        organization_id,
+                        senderId: this.server.id
+                    });
+                }
+            }
+        } 
+        else if (method === 'mesh.orgData') {
+            const { organization_id, data, senderWorkerId } = payload;
+
+            // Relay locally to sibling workers hosting tenant
+            const activeWorkerIds = this.orgWorkers.get(organization_id);
+            if (activeWorkerIds && activeWorkerIds.size > 0 && this.server) {
+                const siblingWorkerIds = senderWorkerId 
+                    ? Array.from(activeWorkerIds).filter(wId => wId !== senderWorkerId)
+                    : Array.from(activeWorkerIds);
+
+                if (siblingWorkerIds.length > 0) {
+                    try {
+                        this.server.send({
+                            method: 'mesh.inbound',
+                            workers: siblingWorkerIds,
+                            master: false,
+                            data: typeof data === 'string' ? data : JSON.stringify(data)
+                        });
+                    } catch (err) {
+                        console.error("[@cocreate/server-mesh] Failed to relay local orgData:", err.message);
+                    }
+                }
+            }
+
+            // Relay to network peer sockets subscribed to tenant
+            const targetSockets = this.orgServers.get(organization_id);
+            if (targetSockets && targetSockets.size > 0) {
+                this.socketSend(Array.from(targetSockets), {
+                    method: 'mesh.orgData',
+                    organization_id,
+                    data
+                });
+            }
+        } 
+        else {
+            const targetMethod = method.replace(/^mesh\./, '');
+            const systemEvents = ['restart', 'reboot', 'shutdown', 'cordon', 'shed', 'drain'];
+
+            if (systemEvents.includes(targetMethod)) {
+                const actionPayload = { ...payload, method: targetMethod };
                 if (typeof this.server.send === 'function') {
                     this.server.send(actionPayload);
                 }
-
-                // Emit locally on mesh instance
-                this.emit(eventName, actionPayload);
-            });
+                this.emit(targetMethod, actionPayload);
+            } else {
+                this.emit(method, payload);
+            }
         }
+    }
 
-        // Handle mesh status updates dispatched from local server state transitions
-        this.server.on('mesh.node_status_update', (payload) => {
-            this.broadcast({
-                method: 'mesh.node_status_update',
-                server_id: this.server.id,
-                status: payload?.status,
-                timestamp: Date.now()
-            });
+    /**
+     * Registers protocol handlers for multi-tenant subscriptions and consensus events.
+     */
+    setupProtocolListeners() {
+        this.on('mesh.orgAdded', (message, ws) => {
+            if (!ws) return;
+            const organization_id = message.organization_id;
+            const ip = ws.remoteAddress || ws._socket?.remoteAddress;
+            const peerId = message.senderId || ip;
+
+            if (!this.orgServers.has(organization_id)) {
+                this.orgServers.set(organization_id, new Set());
+            }
+            this.orgServers.get(organization_id).add(ws);
+            console.log(`[@cocreate/server-mesh] Peer ${peerId} registered subscription for org "${organization_id}"`);
+        });
+
+        this.on('mesh.orgDeleted', (message, ws) => {
+            if (!ws) return;
+            const organization_id = message.organization_id;
+            const ip = ws.remoteAddress || ws._socket?.remoteAddress;
+            const peerId = message.senderId || ip;
+
+            const sockets = this.orgServers.get(organization_id);
+            if (sockets) {
+                sockets.delete(ws);
+                if (sockets.size === 0) {
+                    this.orgServers.delete(organization_id);
+                }
+                console.log(`[@cocreate/server-mesh] Peer ${peerId} de-registered subscription from org "${organization_id}"`);
+            }
+        });
+
+        this.on('mesh.orgData', (message) => {
+            const { organization_id, data } = message;
+
+            const activeWorkerIds = this.orgWorkers.get(organization_id);
+            if (activeWorkerIds && activeWorkerIds.size > 0 && this.server) {
+                try {
+                    this.server.send({
+                        method: 'mesh.inbound',
+                        workers: Array.from(activeWorkerIds),
+                        master: false,
+                        data: typeof data === 'string' ? data : JSON.stringify(data)
+                    });
+                } catch (err) {
+                    console.error(`[@cocreate/server-mesh] Failed to relay incoming orgData for org "${organization_id}":`, err.message);
+                }
+            }
+        });
+
+        this.on('mesh.peer_pruned', (message) => {
+            if (message.deadIp && this.outboundManager) {
+                const activeTimerId = this.outboundManager.pruneTimers.get(message.deadIp);
+                if (activeTimerId) {
+                    clearTimeout(activeTimerId);
+                    this.outboundManager.pruneTimers.delete(message.deadIp);
+                    console.log(`[@cocreate/server-mesh] Cancelled prune schedule for ${message.deadIp} on peer consensus.`);
+                }
+            }
+        });
+
+        this.on('mesh.raw_message', (message) => {
+            if (this.server) {
+                try {
+                    this.server.send({
+                        method: 'mesh.inbound',
+                        broadcast: true,
+                        master: false,
+                        data: JSON.stringify(message)
+                    });
+                } catch (err) {
+                    console.error("[@cocreate/server-mesh] Failed to relay raw fallback message:", err.message);
+                }
+            }
         });
     }
 
     /**
-     * Connects to a remote mesh peer node over WebSocket.
+     * Parses incoming network socket payloads and dispatches events.
      * 
-     * @param {string} peerUrl - WebSocket URL of the target remote mesh peer
+     * @param {string|Buffer} rawData 
+     * @param {Object} ws - Active network socket reference
      */
-    connectPeer(peerUrl) {
-        if (this.isClosed || !peerUrl || this.peers.has(peerUrl)) return;
-
-        this.peers.add(peerUrl);
-
+    handleIncomingMessage(rawData, ws) {
+        let message;
         try {
-            const ws = new WebSocket(peerUrl, {
-                headers: {
-                    'x-server-id': this.server?.id || '',
-                    'x-mesh-node': 'true'
-                }
-            });
-
-            ws.on('open', () => {
-                console.log(`[@cocreate/server-mesh] Connected to peer mesh node: ${peerUrl}`);
-                this.nodes.set(peerUrl, ws);
-                
-                if (this.reconnectTimers.has(peerUrl)) {
-                    clearTimeout(this.reconnectTimers.get(peerUrl));
-                    this.reconnectTimers.delete(peerUrl);
-                }
-
-                // Handshake identify node
-                ws.send(JSON.stringify({
-                    method: 'mesh.handshake',
-                    server_id: this.server?.id,
-                    timestamp: Date.now()
-                }));
-            });
-
-            ws.on('message', (data) => {
-                this.handleIncomingMessage(data, peerUrl);
-            });
-
-            ws.on('error', (err) => {
-                console.error(`[@cocreate/server-mesh] Error on peer connection ${peerUrl}:`, err.message);
-            });
-
-            ws.on('close', () => {
-                console.warn(`[@cocreate/server-mesh] Disconnected from peer mesh node: ${peerUrl}`);
-                this.nodes.delete(peerUrl);
-                this.scheduleReconnect(peerUrl);
-            });
+            message = JSON.parse(rawData.toString());
         } catch (err) {
-            console.error(`[@cocreate/server-mesh] Failed to initiate connection to peer ${peerUrl}:`, err.message);
-            this.scheduleReconnect(peerUrl);
-        }
-    }
-
-    /**
-     * Parses and processes incoming mesh messages from remote peers.
-     * 
-     * @param {string|Buffer} rawData - Raw message data from socket
-     * @param {string} peerUrl - Originating peer identification URL
-     */
-    handleIncomingMessage(rawData, peerUrl) {
-        let payload;
-        try {
-            payload = JSON.parse(rawData.toString());
-        } catch (err) {
-            console.error(`[@cocreate/server-mesh] Failed to parse message from ${peerUrl}:`, err.message);
             return;
         }
 
-        if (!payload || typeof payload !== 'object') return;
+        if (!message || typeof message !== 'object') return;
 
-        // Ignore messages originated by this same server node
-        if (payload.server_id && payload.server_id === this.server?.id) {
+        if (message.server_id && message.server_id === this.server?.id) {
             return;
         }
 
-        console.log(`[@cocreate/server-mesh] Received mesh event '${payload.method}' from node ${payload.server_id || peerUrl}`);
+        const method = message.method;
+        if (!method) return;
 
-        // Handle mesh system commands by routing them directly into server.send
-        const targetMethod = payload.method?.replace(/^mesh\./, '');
+        const targetMethod = method.replace(/^mesh\./, '');
         const systemEvents = ['restart', 'reboot', 'shutdown', 'cordon', 'shed', 'drain'];
 
         if (systemEvents.includes(targetMethod)) {
-            const ipcPayload = {
-                ...payload,
-                method: targetMethod
-            };
+            const ipcPayload = { ...message, method: targetMethod };
 
-            // Dispatch command locally via server.send
             if (this.server && typeof this.server.send === 'function') {
                 this.server.send(ipcPayload);
             }
 
-            // Emit command event locally on ServerMesh instance
-            this.emit(targetMethod, ipcPayload);
-        } else if (payload.method) {
-            // Emit non-system custom mesh event locally
-            this.emit(payload.method, payload);
+            this.emit(targetMethod, ipcPayload, ws);
+        } else {
+            this.emit(method, message, ws);
+        }
+    }
 
-            // Also emit via server.on bus if server instance is active
-            if (this.server && typeof this.server.emit === 'function') {
-                this.server.emit(payload.method, payload);
+    /**
+     * Transmits payload across active network socket tunnels or targeted servers.
+     * 
+     * @param {Object} payload 
+     */
+    send(payload) {
+        if (!payload || typeof payload !== 'object' || !payload.method) {
+            console.error("[@cocreate/server-mesh] Cannot transmit mesh payload without a defined 'method' key.");
+            return;
+        }
+
+        if (!payload.uuid) {
+            payload.uuid = crypto.randomUUID();
+        }
+
+        const isPrimary = this.server?.isPrimary ?? true;
+
+        if (!isPrimary) {
+            if (typeof this.server?.send === 'function') {
+                this.server.send({
+                    method: 'mesh.outbound_mesh_relay',
+                    payload: payload
+                });
+            }
+        } else {
+            const targets = [];
+
+            if (payload.broadcast === true || !payload.servers) {
+                targets.push(...this.activeConnections.values());
+            } else {
+                const serversList = Array.isArray(payload.servers) ? payload.servers : [payload.servers];
+                for (const id of serversList) {
+                    const socket = this.activeConnections.get(id);
+                    if (socket) {
+                        targets.push(socket);
+                    }
+                }
+            }
+
+            const uniqueSockets = Array.from(new Set(targets));
+            this.socketSend(uniqueSockets, payload);
+        }
+    }
+
+    /**
+     * Safely serializes and sends payload data across network sockets without direct library coupling.
+     * 
+     * @param {Object|Object[]} sockets - Target socket reference(s)
+     * @param {Object} data 
+     */
+    socketSend(sockets, data) {
+        const targetSockets = Array.isArray(sockets) ? sockets : [sockets];
+        const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
+
+        for (const socket of targetSockets) {
+            try {
+                // 1 corresponds to OPEN state in WebSocket standard protocol implementations
+                if (socket && socket.readyState === 1) {
+                    socket.send(dataStr);
+                }
+            } catch (err) {
+                console.error(`[@cocreate/server-mesh] Error executing socketSend transaction:`, err.message);
             }
         }
     }
 
     /**
-     * Transmits a payload across all connected mesh nodes.
-     * If local dispatch is required, forwards directly to server.send.
+     * Safely removes a closed socket connection from tenant routing maps.
      * 
-     * @param {Object} payload - Message payload to broadcast across mesh
+     * @param {Object} ws 
      */
-    send(payload = {}) {
-        if (!payload || typeof payload !== 'object') return;
-
-        const messagePayload = {
-            ...payload,
-            server_id: this.server?.id || null,
-            timestamp: payload.timestamp || Date.now()
-        };
-
-        // Broadcast to all active peer WebSocket node connections
-        this.broadcast(messagePayload);
-
-        // If local worker/cluster broadcast requested, dispatch via server.send
-        if (payload.local !== false && this.server && typeof this.server.send === 'function') {
-            if (payload.method && !payload.method.startsWith('mesh.')) {
-                this.server.send(messagePayload);
-            }
-        }
-    }
-
-    /**
-     * Outbound broadcast helper sending JSON payloads to all socket connections.
-     * 
-     * @param {Object} payload - Serialized payload to send across peers
-     */
-    broadcast(payload) {
-        if (this.nodes.size === 0) return;
-
-        const serialized = JSON.stringify(payload);
-        for (const [peerUrl, ws] of this.nodes.entries()) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                try {
-                    ws.send(serialized);
-                } catch (err) {
-                    console.error(`[@cocreate/server-mesh] Failed to send payload to peer ${peerUrl}:`, err.message);
+    removeSocketFromAllOrgServers(ws) {
+        for (const [orgId, sockets] of this.orgServers.entries()) {
+            if (sockets.has(ws)) {
+                sockets.delete(ws);
+                if (sockets.size === 0) {
+                    this.orgServers.delete(orgId);
                 }
             }
         }
     }
 
     /**
-     * Schedules auto-reconnection for a disconnected peer.
-     * 
-     * @param {string} peerUrl - Remote peer URL to reconnect
-     */
-    scheduleReconnect(peerUrl) {
-        if (this.isClosed || this.reconnectTimers.has(peerUrl)) return;
-
-        const timer = setTimeout(() => {
-            this.reconnectTimers.delete(peerUrl);
-            this.peers.delete(peerUrl);
-            console.log(`[@cocreate/server-mesh] Attempting reconnection to peer: ${peerUrl}`);
-            this.connectPeer(peerUrl);
-        }, 5000);
-
-        if (timer.unref) timer.unref();
-        this.reconnectTimers.set(peerUrl, timer);
-    }
-
-    /**
-     * Starts interval timer verifying health of active mesh peer connections.
-     */
-    startHeartbeat() {
-        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-
-        this.heartbeatInterval = setInterval(() => {
-            if (this.isClosed) return;
-
-            const pingPayload = JSON.stringify({
-                method: 'mesh.ping',
-                server_id: this.server?.id,
-                timestamp: Date.now()
-            });
-
-            for (const [peerUrl, ws] of this.nodes.entries()) {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(pingPayload);
-                } else if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-                    this.nodes.delete(peerUrl);
-                    this.scheduleReconnect(peerUrl);
-                }
-            }
-        }, this.heartbeatMs);
-
-        if (this.heartbeatInterval.unref) {
-            this.heartbeatInterval.unref();
-        }
-    }
-
-    /**
-     * Internal event handler reference for server listeners.
+     * Internal server event handler callback.
      */
     handleServerEvent(payload) {
         this.send(payload);
     }
 
     /**
-     * Gracefully closes all active mesh sockets, clears reconnect timers,
-     * and unbinds event listeners.
+     * Initiates coordinated mesh shutdown, closing server ports and outbound timers.
+     * 
+     * @returns {Promise<void>}
      */
-    close() {
+    async close() {
+        if (this.isClosed) return;
         this.isClosed = true;
 
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
+        console.log(`[@cocreate/server-mesh] Coordinated secure mesh shutdown triggered.`);
+
+        if (this.outboundManager) {
+            this.outboundManager.close();
         }
 
-        // Clear reconnection timers
-        for (const [peerUrl, timer] of this.reconnectTimers.entries()) {
-            clearTimeout(timer);
-        }
-        this.reconnectTimers.clear();
-
-        // Close peer socket connections
-        for (const [peerUrl, ws] of this.nodes.entries()) {
-            try {
-                if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-                    ws.close(1000, 'Mesh shutting down');
-                }
-            } catch (err) {
-                // Fail gracefully during shutdown
+        const uniqueSockets = new Set(this.activeConnections.values());
+        for (const ws of uniqueSockets) {
+            if (ws && ws.readyState === 1) {
+                try { ws.close(); } catch {}
             }
         }
+        this.activeConnections.clear();
 
-        this.nodes.clear();
-        this.peers.clear();
-        this.removeAllListeners();
-
-        console.log(`[@cocreate/server-mesh] ServerMesh network layer closed.`);
+        if (this.inboundManager) {
+            await this.inboundManager.close();
+        }
     }
 }
 
-// Export singleton instance as default export
+// Export singleton instance as default export and named export
 export const serverMesh = new ServerMesh();
 export default serverMesh;
