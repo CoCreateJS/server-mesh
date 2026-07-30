@@ -1,6 +1,6 @@
 {
   "name": "@cocreate/server-mesh",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Decentralized, event-driven P2P server mesh and transport fabric for CoCreate Server. Optimizes multi-tenant cluster concurrency with dynamic, tenant-isolated WebSocket data tunnels.",
   "keywords": [
     "cocreate",
