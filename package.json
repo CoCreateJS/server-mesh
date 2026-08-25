@@ -27,7 +27,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CoCreate-app/CoCreate-server-mesh.git"
+    "url": "git+https://gitlab.com/cocreatejs/CoCreate-server-mesh.git"
   },
   "author": "CoCreate LLC",
   "license": "AGPL-3.0",
