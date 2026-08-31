@@ -70,7 +70,7 @@ export class ServerMeshOutbound {
         const readPayload = {
             method: 'object.read',
             array: 'servers',
-            $filter: {
+            filter: {
                 query: { _id: { $lt: this.server.id } },
                 sort: { _id: 1 },
                 limit: 0
