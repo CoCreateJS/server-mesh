@@ -231,7 +231,7 @@ export class ServerMesh extends EventEmitter {
                 ...payload,
                 organization_id,
                 master: false,
-                meshReceived: true
+                status: 'received'
             });
         });
 
@@ -314,7 +314,7 @@ export class ServerMesh extends EventEmitter {
             this.server.send({
                 ...message,
                 master: false,
-                meshReceived: true
+                status: 'received'
             });
         } else {
             this.emit(method, message, ws);
@@ -357,6 +357,10 @@ export class ServerMesh extends EventEmitter {
 
         if (!payload.uuid) {
             payload.uuid = crypto.randomUUID();
+        }
+        if (payload.serverId === undefined) {
+            payload.serverId = this.server?.id;
+            payload.status = 'sent';
         }
 
         const isPrimary = this.server?.isPrimary ?? true;
