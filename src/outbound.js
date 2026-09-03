@@ -17,7 +17,7 @@ import { WebSocket } from 'ws';
 
 /**
  * ServerMeshOutbound manages outbound peer discovery, connection establishment,
- * reconnection retries, and reacting to server events requiring outbound dispatch.
+ * and server events requiring outbound dispatch.
  */
 export class ServerMeshOutbound {
     constructor(mesh) {
@@ -26,6 +26,15 @@ export class ServerMeshOutbound {
         this.meshPort = process.env.MESH_PORT || 8090;
         this.retryTimers = new Map();
         this.pruneTimers = new Map();
+        this.peers = [];
+    }
+
+    closeOrganization(organization_id) {
+        for (const [key, timerId] of this.retryTimers) {
+            if (!key.startsWith(`${organization_id}:`)) continue;
+            clearTimeout(timerId);
+            this.retryTimers.delete(key);
+        }
     }
 
     /**
@@ -88,6 +97,7 @@ export class ServerMeshOutbound {
         }
 
         const peers = this.normalizePeersList(readResult);
+        this.peers = peers;
 
         for (const targetPeer of peers) {
             this.connectPeer(targetPeer, peers.length);
@@ -100,11 +110,12 @@ export class ServerMeshOutbound {
      * @param {Object|string} targetPeer - Peer metadata object or IP string
      * @param {number} totalPeers - Count of peers for calculating eviction delay
      */
-    connectPeer(targetPeer, totalPeers = 1) {
+    connectPeer(targetPeer, totalPeers = 1, organization_id) {
         const targetIp = typeof targetPeer === 'string' ? targetPeer : targetPeer?.ip;
         const targetId = typeof targetPeer === 'object' ? targetPeer._id : targetIp;
+        const connectionKey = `${organization_id || 'control'}:${targetId || targetIp}`;
 
-        if (!targetIp || targetIp === this.server.ip || this.mesh.activeConnections.has(targetIp)) return;
+        if (!targetIp || targetIp === this.server.ip || this.mesh.activeConnections.has(connectionKey)) return;
 
         console.log(`[@cocreate/server-mesh/outbound] Initiating outbound link to peer: ${targetIp}`);
 
@@ -113,8 +124,12 @@ export class ServerMeshOutbound {
 
         const connectToPeer = () => {
             if (this.mesh.isClosed) return;
+            if (organization_id && !this.mesh.organizations.has(organization_id)) return;
 
-            const targetUrl = `wss://${targetIp}:${this.meshPort}/${this.server.organization_id}`;
+            const path = organization_id
+                ? `/${encodeURIComponent(organization_id)}`
+                : '';
+            const targetUrl = `wss://${targetIp}:${this.meshPort}${path}`;
             const clientSocket = new WebSocket(targetUrl, [
                 encodeURIComponent(JSON.stringify({
                     type: 'peer',
@@ -130,6 +145,15 @@ export class ServerMeshOutbound {
 
             clientSocket.isAlive = true;
             clientSocket.remoteAddress = targetIp;
+            clientSocket.serverId = targetId || targetIp;
+            clientSocket.organization_id = organization_id;
+            clientSocket.intentionalClose = false;
+            this.mesh.activeConnections.set(connectionKey, clientSocket);
+            if (!organization_id) {
+                this.mesh.addControlSocket(clientSocket);
+            } else {
+                this.mesh.addOrganizationSocket(organization_id, clientSocket);
+            }
             clientSocket.on('pong', () => { clientSocket.isAlive = true; });
             clientSocket.on('ping', () => { clientSocket.pong(); });
 
@@ -137,51 +161,35 @@ export class ServerMeshOutbound {
                 console.log(`[@cocreate/server-mesh/outbound] Outbound connection complete to peer: ${targetIp}`);
                 retryCount = 0;
 
-                if (this.retryTimers.has(targetIp)) clearTimeout(this.retryTimers.get(targetIp));
+                if (this.retryTimers.has(connectionKey)) {
+                    clearTimeout(this.retryTimers.get(connectionKey));
+                }
                 if (this.pruneTimers.has(targetIp)) clearTimeout(this.pruneTimers.get(targetIp));
 
-                this.retryTimers.delete(targetIp);
+                this.retryTimers.delete(connectionKey);
                 this.pruneTimers.delete(targetIp);
 
                 clientSocket.isPeer = true;
-                clientSocket.isPlatformTunnel = true;
+                clientSocket.isControlSocket = !organization_id;
+                if (clientSocket.isControlSocket) {
+                    this.mesh.syncOrganizations(clientSocket);
+                }
 
-                if (targetId) this.mesh.activeConnections.set(targetId, clientSocket);
-                this.mesh.activeConnections.set(targetIp, clientSocket);
             });
 
             clientSocket.on('close', () => {
-                if (targetId) this.mesh.activeConnections.delete(targetId);
-                this.mesh.activeConnections.delete(targetIp);
-                this.retryTimers.delete(targetIp);
+                this.mesh.activeConnections.delete(connectionKey);
+                this.retryTimers.delete(connectionKey);
                 this.mesh.removeSocketFromAllOrgServers(clientSocket);
 
-                if (this.mesh.isClosed) return;
+                if (this.mesh.isClosed || clientSocket.intentionalClose) return;
+                if (organization_id && !this.mesh.organizations.has(organization_id)) return;
 
                 if (retryCount < maxRetries) {
                     retryCount++;
                     const delay = 5000 + Math.floor(Math.random() * 2000);
-                    console.warn(`[@cocreate/server-mesh/outbound] Peer dropped (${targetIp}). Retrying in ${delay}ms...`);
                     const timerId = setTimeout(connectToPeer, delay);
-                    this.retryTimers.set(targetIp, timerId);
-                } else {
-                    const staggerDelay = totalPeers * 1000;
-                    console.warn(`[@cocreate/server-mesh/outbound] Peer dead (${targetIp}). Scheduling consensus notification in ${staggerDelay}ms...`);
-
-                    const pruneTimerId = setTimeout(() => {
-                        console.error(`[@cocreate/server-mesh/outbound] Peer node dead: ${targetIp}`);
-
-                        this.mesh.send({
-                            method: 'mesh.peer_pruned',
-                            deadIp: targetIp,
-                            isForwarded: true,
-                            senderId: this.server.id
-                        });
-
-                        this.pruneTimers.delete(targetIp);
-                    }, staggerDelay);
-
-                    this.pruneTimers.set(targetIp, pruneTimerId);
+                    this.retryTimers.set(connectionKey, timerId);
                 }
             });
 
@@ -211,7 +219,7 @@ export class ServerMeshOutbound {
     }
 
     /**
-     * Clears all outbound retry and prune timers on teardown.
+     * Clears outbound retry and prune timers on teardown.
      */
     close() {
         for (const timerId of this.retryTimers.values()) clearTimeout(timerId);

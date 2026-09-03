@@ -32,12 +32,68 @@ export class ServerMesh extends EventEmitter {
         this.outboundManager = new ServerMeshOutbound(this);
 
         // Shared Connection & Multi-tenant Routing Tables
-        this.activeConnections = new Map(); // serverId / IP -> Network Socket
-        this.orgWorkers = new Map();        // organization_id -> Set(workerId)
-        this.orgServers = new Map();        // organization_id -> Set(Network Socket)
+        this.activeConnections = new Map(); // organization_id/serverId -> Network Socket
+        this.controlSockets = [];
+        this.organizations = new Map();     // organization_id -> Network Socket[]
 
         this.isClosed = false;
         this.handleServerEvent = this.handleServerEvent.bind(this);
+    }
+
+    addOrganizationSocket(organization_id, ws) {
+        if (!organization_id || !ws) return;
+        ws.organization_id = organization_id;
+        if (!this.organizations.has(organization_id)) {
+            this.organizations.set(organization_id, []);
+        }
+        const sockets = this.organizations.get(organization_id);
+        if (!sockets.includes(ws)) sockets.push(ws);
+    }
+
+    addControlSocket(ws) {
+        if (!ws || this.controlSockets.includes(ws)) return;
+        ws.isControlSocket = true;
+        this.controlSockets.push(ws);
+    }
+
+    openOrganization(organization_id) {
+        if (!organization_id || !this.server?.isPrimary) return;
+        if (!this.organizations.has(organization_id)) {
+            this.organizations.set(organization_id, []);
+        }
+        this.announceOrganization(organization_id);
+    }
+
+    announceOrganization(organization_id, socket) {
+        const controlSockets = socket ? [socket] : this.controlSockets;
+        this.socketSend(controlSockets, {
+            method: 'orgRegistered',
+            organization_id,
+            serverId: this.server.id
+        });
+    }
+
+    syncOrganizations(socket) {
+        for (const organization_id of this.organizations.keys()) {
+            if (organization_id === this.server.organization_id) continue;
+            this.announceOrganization(organization_id, socket);
+        }
+    }
+
+    closeOrganization(organization_id) {
+        if (!organization_id || !this.server?.isPrimary) return;
+        this.outboundManager.closeOrganization(organization_id);
+        const sockets = this.organizations.get(organization_id);
+        if (!sockets) return;
+        this.organizations.delete(organization_id);
+        for (const ws of sockets) {
+            if (ws.isControlSocket) continue;
+            ws.intentionalClose = true;
+            for (const [key, socket] of this.activeConnections) {
+                if (socket === ws) this.activeConnections.delete(key);
+            }
+            try { ws.close(); } catch {}
+        }
     }
 
     /**
@@ -107,69 +163,10 @@ export class ServerMesh extends EventEmitter {
             const dataToTransmit = payload.payload ? payload.payload : payload;
             this.send(dataToTransmit);
         } 
-        else if (method === 'mesh.registerOrg' || method === 'mesh.orgAdded') {
-            const { organization_id, workerId } = payload;
-            let isNewOrg = false;
-
-            if (!this.orgWorkers.has(organization_id)) {
-                this.orgWorkers.set(organization_id, new Set());
-                isNewOrg = true;
-            }
-
-            if (workerId) {
-                this.orgWorkers.get(organization_id).add(workerId);
-            }
-
-            if (isNewOrg) {
-                this.send({
-                    method: 'mesh.orgAdded',
-                    organization_id,
-                    senderId: this.server.id
-                });
-            }
-        } 
-        else if (method === 'mesh.deregisterOrg' || method === 'mesh.orgDeleted') {
-            const { organization_id, workerId } = payload;
-            const workersSet = this.orgWorkers.get(organization_id);
-
-            if (workersSet) {
-                if (workerId) workersSet.delete(workerId);
-                if (!workerId || workersSet.size === 0) {
-                    this.orgWorkers.delete(organization_id);
-                    this.send({
-                        method: 'mesh.orgDeleted',
-                        organization_id,
-                        senderId: this.server.id
-                    });
-                }
-            }
-        } 
         else if (method === 'mesh.orgData') {
-            const { organization_id, data, senderWorkerId } = payload;
-
-            // Relay locally to sibling workers hosting tenant
-            const activeWorkerIds = this.orgWorkers.get(organization_id);
-            if (activeWorkerIds && activeWorkerIds.size > 0 && this.server) {
-                const siblingWorkerIds = senderWorkerId 
-                    ? Array.from(activeWorkerIds).filter(wId => wId !== senderWorkerId)
-                    : Array.from(activeWorkerIds);
-
-                if (siblingWorkerIds.length > 0) {
-                    try {
-                        this.server.send({
-                            method: 'mesh.inbound',
-                            workers: siblingWorkerIds,
-                            master: false,
-                            data: typeof data === 'string' ? data : JSON.stringify(data)
-                        });
-                    } catch (err) {
-                        console.error("[@cocreate/server-mesh] Failed to relay local orgData:", err.message);
-                    }
-                }
-            }
-
+            const { organization_id, data } = payload;
             // Relay to network peer sockets subscribed to tenant
-            const targetSockets = this.orgServers.get(organization_id);
+            const targetSockets = this.organizations.get(organization_id);
             if (targetSockets && targetSockets.size > 0) {
                 this.socketSend(Array.from(targetSockets), {
                     method: 'mesh.orgData',
@@ -202,12 +199,9 @@ export class ServerMesh extends EventEmitter {
             if (!ws) return;
             const organization_id = message.organization_id;
             const ip = ws.remoteAddress || ws._socket?.remoteAddress;
-            const peerId = message.senderId || ip;
+            const peerId = message.serverId || message.senderId || ip;
 
-            if (!this.orgServers.has(organization_id)) {
-                this.orgServers.set(organization_id, new Set());
-            }
-            this.orgServers.get(organization_id).add(ws);
+            this.addOrganizationSocket(organization_id, ws);
             console.log(`[@cocreate/server-mesh] Peer ${peerId} registered subscription for org "${organization_id}"`);
         });
 
@@ -215,13 +209,14 @@ export class ServerMesh extends EventEmitter {
             if (!ws) return;
             const organization_id = message.organization_id;
             const ip = ws.remoteAddress || ws._socket?.remoteAddress;
-            const peerId = message.senderId || ip;
+            const peerId = message.serverId || message.senderId || ip;
 
-            const sockets = this.orgServers.get(organization_id);
+            const sockets = this.organizations.get(organization_id);
             if (sockets) {
-                sockets.delete(ws);
-                if (sockets.size === 0) {
-                    this.orgServers.delete(organization_id);
+                const index = sockets.indexOf(ws);
+                if (index !== -1) sockets.splice(index, 1);
+                if (sockets.length === 0) {
+                    this.organizations.delete(organization_id);
                 }
                 console.log(`[@cocreate/server-mesh] Peer ${peerId} de-registered subscription from org "${organization_id}"`);
             }
@@ -229,20 +224,15 @@ export class ServerMesh extends EventEmitter {
 
         this.on('mesh.orgData', (message) => {
             const { organization_id, data } = message;
+            if (!this.server || !organization_id || !data) return;
 
-            const activeWorkerIds = this.orgWorkers.get(organization_id);
-            if (activeWorkerIds && activeWorkerIds.size > 0 && this.server) {
-                try {
-                    this.server.send({
-                        method: 'mesh.inbound',
-                        workers: Array.from(activeWorkerIds),
-                        master: false,
-                        data: typeof data === 'string' ? data : JSON.stringify(data)
-                    });
-                } catch (err) {
-                    console.error(`[@cocreate/server-mesh] Failed to relay incoming orgData for org "${organization_id}":`, err.message);
-                }
-            }
+            const payload = typeof data === 'string' ? JSON.parse(data) : data;
+            this.server.send({
+                ...payload,
+                organization_id,
+                master: false,
+                meshReceived: true
+            });
         });
 
         this.on('mesh.peer_pruned', (message) => {
@@ -288,17 +278,31 @@ export class ServerMesh extends EventEmitter {
 
         if (!message || typeof message !== 'object') return;
 
-        if (message.server_id && message.server_id === this.server?.id) {
+        if (message.cluster !== undefined) {
+            const clusters = Array.isArray(message.cluster)
+                ? message.cluster
+                : [message.cluster];
+            if (!clusters.includes(this.server?.cluster_id)) return;
+        }
+
+        if (message.serverId && message.serverId === this.server?.id) {
             return;
         }
 
         const method = message.method;
         if (!method) return;
 
+        if (method === 'orgRegistered') {
+            this.handleOrganizationRegistration(message, ws);
+            return;
+        }
+
         const targetMethod = method.replace(/^mesh\./, '');
         const systemEvents = ['restart', 'reboot', 'shutdown', 'cordon', 'shed', 'drain'];
 
-        if (systemEvents.includes(targetMethod)) {
+        if (method === 'mesh.orgAdded' || method === 'mesh.orgDeleted') {
+            this.emit(method, message, ws);
+        } else if (systemEvents.includes(targetMethod)) {
             const ipcPayload = { ...message, method: targetMethod };
 
             if (this.server && typeof this.server.send === 'function') {
@@ -306,9 +310,38 @@ export class ServerMesh extends EventEmitter {
             }
 
             this.emit(targetMethod, ipcPayload, ws);
+        } else if (message.organization_id) {
+            this.server.send({
+                ...message,
+                master: false,
+                meshReceived: true
+            });
         } else {
             this.emit(method, message, ws);
         }
+    }
+
+    handleOrganizationRegistration(message, ws) {
+        const organization_id = message.organization_id;
+        if (!organization_id || !this.organizations.has(organization_id)) return;
+
+        const remoteServerId = message.serverId || ws.serverId;
+        if (!remoteServerId || remoteServerId === this.server.id) return;
+
+        if (message.response !== true) {
+            this.socketSend(ws, {
+                method: 'orgRegistered',
+                organization_id,
+                serverId: this.server.id,
+                response: true
+            });
+        }
+
+        if (String(this.server.id) <= String(remoteServerId)) return;
+        this.outboundManager.connectPeer({
+            _id: remoteServerId,
+            ip: ws.remoteAddress
+        }, this.outboundManager.peers.length, organization_id);
     }
 
     /**
@@ -336,19 +369,18 @@ export class ServerMesh extends EventEmitter {
                 });
             }
         } else {
-            const targets = [];
-
-            if (payload.broadcast === true || !payload.servers) {
-                targets.push(...this.activeConnections.values());
-            } else {
-                const serversList = Array.isArray(payload.servers) ? payload.servers : [payload.servers];
-                for (const id of serversList) {
-                    const socket = this.activeConnections.get(id);
-                    if (socket) {
-                        targets.push(socket);
-                    }
-                }
-            }
+            const serverTargets = payload.server ?? payload.servers;
+            const availableSockets = payload.organization_id
+                ? this.organizations.get(payload.organization_id) || []
+                : this.controlSockets;
+            const targets = serverTargets === undefined
+                ? availableSockets
+                : availableSockets.filter(socket => {
+                    const servers = Array.isArray(serverTargets)
+                        ? serverTargets
+                        : [serverTargets];
+                    return servers.includes(socket.serverId);
+                });
 
             const uniqueSockets = Array.from(new Set(targets));
             this.socketSend(uniqueSockets, payload);
@@ -383,12 +415,15 @@ export class ServerMesh extends EventEmitter {
      * @param {Object} ws 
      */
     removeSocketFromAllOrgServers(ws) {
-        for (const [orgId, sockets] of this.orgServers.entries()) {
-            if (sockets.has(ws)) {
-                sockets.delete(ws);
-                if (sockets.size === 0) {
-                    this.orgServers.delete(orgId);
-                }
+        for (const [key, socket] of this.activeConnections) {
+            if (socket === ws) this.activeConnections.delete(key);
+        }
+        const controlIndex = this.controlSockets.indexOf(ws);
+        if (controlIndex !== -1) this.controlSockets.splice(controlIndex, 1);
+        for (const [orgId, sockets] of this.organizations.entries()) {
+            const index = sockets.indexOf(ws);
+            if (index !== -1) {
+                sockets.splice(index, 1);
             }
         }
     }
@@ -418,7 +453,10 @@ export class ServerMesh extends EventEmitter {
         const uniqueSockets = new Set(this.activeConnections.values());
         for (const ws of uniqueSockets) {
             if (ws && ws.readyState === 1) {
-                try { ws.close(); } catch {}
+                try {
+                    ws.intentionalClose = true;
+                    ws.close();
+                } catch {}
             }
         }
         this.activeConnections.clear();

@@ -107,6 +107,16 @@ export class ServerMeshInbound {
 
         this.meshWss.on('connection', (ws, req) => {
             const ip = req.socket.remoteAddress;
+            const organization_id = decodeURIComponent(
+                new URL(req.url, 'https://mesh.local').pathname.slice(1)
+            );
+            if (
+                organization_id &&
+                !this.mesh.organizations.has(organization_id)
+            ) {
+                ws.close();
+                return;
+            }
             let remoteServerId = null;
 
             const protocolHeader = req.headers['sec-websocket-protocol'];
@@ -124,6 +134,12 @@ export class ServerMeshInbound {
 
             ws.isAlive = true;
             ws.remoteAddress = ip;
+            ws.serverId = remoteServerId || ip;
+            if (!organization_id) {
+                this.mesh.addControlSocket(ws);
+            } else {
+                this.mesh.addOrganizationSocket(organization_id, ws);
+            }
             ws.on('pong', () => { ws.isAlive = true; });
 
             ws.on('message', (rawData) => {
@@ -141,8 +157,10 @@ export class ServerMeshInbound {
                 console.error(`[@cocreate/server-mesh/inbound] Inbound socket error (${identifier}):`, err.message);
             });
 
-            this.mesh.activeConnections.set(identifier, ws);
-            if (remoteServerId) this.mesh.activeConnections.set(ip, ws);
+            const connectionKey = `${organization_id || 'control'}:${identifier}`;
+            this.mesh.activeConnections.set(connectionKey, ws);
+            ws.isControlSocket = !organization_id;
+            if (ws.isControlSocket) this.mesh.syncOrganizations(ws);
         });
     }
 
@@ -159,7 +177,7 @@ export class ServerMeshInbound {
                 this.server.send({
                     method: 'mesh.inbound',
                     broadcast: payload.broadcast ?? true,
-                    workers: payload.workers,
+                    worker: payload.worker,
                     master: false,
                     data: typeof payload.data === 'string' ? payload.data : JSON.stringify(payload.data)
                 });

@@ -1,6 +1,6 @@
 # @cocreate/server-mesh
 
-A high-performance, self-healing, peer-to-peer (P2P) encrypted transport fabric built for distributed cluster orchestration, real-time tenant routing, and inter-node event synchronization across the CoCreate ecosystem.
+A peer-to-peer WebSocket transport for server control, organization-scoped messaging, and inter-node event synchronization across the CoCreate ecosystem.
 
 ---
 
@@ -17,7 +17,7 @@ For complete API references, deployment guides, and architecture documentation, 
 - [Quick Start](#quick-start)
 - [Routing Directives & Targeting Matrix](#routing-directives--targeting-matrix)
 - [Tenant-Aware Routing Protocols](#tenant-aware-routing-protocols)
-- [Self-Healing & Reconnection Logic](#self-healing--reconnection-logic)
+- [Connection Lifecycle](#connection-lifecycle)
 - [Programmatic API Reference](#programmatic-api-reference)
 - [Security & TLS Specification](#security--tls-specification)
 - [Environment Variables](#environment-variables)
@@ -31,21 +31,21 @@ For complete API references, deployment guides, and architecture documentation, 
 
 ## Overview
 
-`@cocreate/server-mesh` serves as the real-time inter-server transport plane for `@cocreate/server`. It establishes zero-trust, mutual P2P encrypted WebSocket tunnels between cluster nodes, enabling seamless multi-tenant data propagation, worker thread relays, and distributed cluster command execution.
+`@cocreate/server-mesh` is the inter-server transport plane for `@cocreate/server`. It establishes TLS WebSocket connections between server nodes for control messages and organization-scoped data propagation.
 
-Designed as a pure transport fabric, `@cocreate/server-mesh` blindly routes and emits network payloads as standard `EventEmitter` events across the cluster without introducing business-logic overhead.
+IPC handles local worker routing. Server mesh handles only connections and messages between servers.
 
 ---
 
 ## Key Features
 
-- **Zero-Trust Ephemeral TLS:** Automatically generates temporary TLS credentials for secure node-to-node communication over the mesh network.
+- **Ephemeral TLS:** Automatically generates temporary TLS credentials for encrypted node-to-node communication.
 - **Polymorphic Target Directives:** Unicast, multicast, broadcast, worker-specific, or tenant-aware routing using a unified payload format.
-- **Cryptographic Traceability:** Automatically stamps every outgoing frame with a unique `crypto.randomUUID()` identifier for distributed tracing and replay protection.
-- **Tenant Isolation:** Dynamically tracks tenant-to-worker and tenant-to-server mappings so messages are only delivered to nodes actively serving an organization.
-- **Self-Healing Reconnection:** Uses exponential backoff with randomized jitter to prevent reconnection storms after network interruptions.
+- **Message Identity:** Preserves an existing `uuid` and creates one for payloads sent through `ServerMesh.send()` when absent.
+- **Tenant Isolation:** Tracks tenant-to-server membership so messages are only delivered to nodes actively serving an organization. Local worker membership is owned by `@cocreate/server` IPC.
+- **Connection Recovery:** Unexpected network disconnects retry automatically; intentional organization shutdowns do not reconnect.
 - **Cluster IPC Integration:** Transparently bridges Node.js Primary and Worker processes while extending communication across distributed servers.
-- **EventEmitter API:** Receive mesh messages using familiar Node.js event listeners.
+- **Control and Organization Sockets:** Uses pathless sockets for server control and `/<organization_id>` sockets for organization traffic.
 
 ---
 
@@ -77,8 +77,8 @@ Worker processes:
 The Primary process:
 
 - Hosts the secure mesh WebSocket server
-- Maintains encrypted peer connections
-- Tracks tenant routing information
+- Loads peer servers from the database and creates pathless control connections
+- Tracks active organizations and their organization-specific sockets
 - Routes messages between workers and remote servers
 
 ---
@@ -116,10 +116,13 @@ await ServerMesh.init(CoCreateServer);
 
 ### Send a Message
 
+Application code normally sends the unified envelope through `server.send()` so
+IPC and mesh routing use the same rules:
+
 Unicast to a single server:
 
 ```javascript
-ServerMesh.send({
+CoCreateServer.send({
 	method: "cache.flush",
 	server: "srv_64f8a1bc90d1",
 	data: {
@@ -131,7 +134,7 @@ ServerMesh.send({
 Multicast to multiple servers:
 
 ```javascript
-ServerMesh.send({
+CoCreateServer.send({
 	method: "worker.task",
 	server: ["srv_64f8a1bc90d1", "srv_90e3b2ac81f4"],
 	worker: 2,
@@ -144,7 +147,7 @@ ServerMesh.send({
 Broadcast to every node:
 
 ```javascript
-ServerMesh.send({
+CoCreateServer.send({
 	broadcast: true,
 	method: "reload.configuration"
 });
@@ -164,26 +167,28 @@ ServerMesh.on("cache.flush", (message) => {
 
 | Target | Payload | Description |
 | --- | --- | --- |
-| Single Server | `{ server: "srv1" }` | Routes only to the specified server. |
+| Single Server | `{ server: "srv1" }` | Routes over the specified server's control or organization socket. |
 | Multiple Servers | `{ server: ["srv1","srv2"] }` | Sends to every listed server. |
-| Worker | `{ server: "srv1", worker: 2 }` | Routes to a specific worker on the target server. |
-| Local Workers | `{ worker: [1,3] }` | Sends only to selected local workers. |
+| Organization | `{ organization_id: "org1" }` | Uses only sockets in that organization's array. |
+| Worker | `{ server: "srv1", worker: 2 }` | IPC targets a worker on the selected server. |
+| Local Workers | `{ worker: [1,3] }` | IPC sends only to the selected local workers. |
 | Broadcast | `{ broadcast: true }` | Delivers to every connected server and local worker. |
 
 ---
 
 ## Tenant-Aware Routing Protocols
 
-The mesh minimizes unnecessary network traffic by maintaining live organization routing maps.
+IPC maintains each server's organization-to-worker map. Mesh creates a separate
+peer socket for each active organization, using `/<organization_id>` as the path.
 
 ```text
 Client Connect
         │
         ▼
-mesh.registerOrg
+registerOrg
         │
         ▼
-Map Organization → Worker
+IPC Maps Organization → Workers
         │
         ▼
 Client Disconnect
@@ -192,43 +197,46 @@ Client Disconnect
 60 Second Grace Timer
         │
         ▼
-mesh.deregisterOrg
+deregisterOrg
         │
         ▼
-mesh.orgDeleted Broadcast
+Close Organization Mesh Sockets
 ```
 
 ### Organization Events
 
 | Event | Description |
 | --- | --- |
-| `mesh.registerOrg` | Registers a worker serving an organization. |
-| `mesh.deregisterOrg` | Removes a worker's organization mapping after all connections close. |
-| `mesh.orgAdded` | Broadcast to peer servers when an organization becomes active. |
-| `mesh.orgDeleted` | Broadcast when an organization is no longer active on a server. |
-| `mesh.orgData` | Routes organization-specific payloads only to subscribed servers and workers. |
+| `registerOrg` | Registers an organization as active on a worker. |
+| `deregisterOrg` | Removes an organization's worker mapping after all connections close. |
+
+The first local worker creates an empty entry in `mesh.organizations` and sends
+`orgRegistered` over every pathless control socket. A peer responds only when
+the same organization exists in its own `mesh.organizations` map. The server
+with the higher `serverId` then creates one organization socket to the lower-ID
+server, preventing duplicate connections.
+
+When the final local worker deregisters, mesh closes that organization's
+connections and deletes its map entry. The remote server removes each socket
+through its normal `close` event; no organization-deletion broadcast is needed.
+
+Organization payloads retain their original envelope. IPC selects local workers;
+the mesh selects remote servers from its organization membership map.
 
 ---
 
-## Self-Healing & Reconnection Logic
+## Connection Lifecycle
 
-When peer servers disconnect, reconnection attempts use exponential backoff combined with randomized jitter to prevent synchronized reconnect storms.
-
-$$
-T_{delay}
-=
-\min\left(30000,\,
-1000\times1.5^{attempt}
-\right)
-+
-random(500,4500)
-$$
-
-Connections automatically retry until:
-
-- the peer becomes available,
-- the server shuts down,
-- or the connection is intentionally closed.
+Pathless `wss://ip` sockets form the server control and health channel and are
+stored separately. The platform becomes an active organization through the same
+`registerOrg` flow as every other organization and receives a distinct
+`wss://ip/<platform_organization_id>` socket once both peers report active clients.
+When a socket closes unexpectedly because of a network failure, it is removed
+from the array and the outbound owner schedules reconnection. When mesh closes a
+socket intentionally, it marks the socket before calling `close()`, cancels any
+pending retry, and does not reconnect. The organization remains registered with
+an empty array until IPC sends `deregisterOrg` after its final local worker
+disconnects.
 
 ---
 
@@ -246,7 +254,9 @@ await ServerMesh.init(server);
 
 ### `ServerMesh.send(payload)`
 
-Routes a payload across the cluster.
+Routes an inter-server payload. Without `organization_id`, it uses pathless
+control sockets. With `organization_id`, it uses only that organization's
+socket array.
 
 ```javascript
 ServerMesh.send({
@@ -273,12 +283,6 @@ await ServerMesh.close();
 ### Events
 
 ```javascript
-ServerMesh.on("mesh.orgAdded", handler);
-
-ServerMesh.on("mesh.orgDeleted", handler);
-
-ServerMesh.on("mesh.orgData", handler);
-
 ServerMesh.on("mesh.raw_message", handler);
 ```
 
@@ -286,11 +290,11 @@ ServerMesh.on("mesh.raw_message", handler);
 
 ## Security & TLS Specification
 
-- **Encrypted Transport:** All peer communication occurs over mutually authenticated encrypted WebSocket connections.
+- **Encrypted Transport:** Peer communication uses TLS WebSocket connections.
 - **Dedicated Mesh Port:** Mesh traffic is isolated from public HTTP and HTTPS traffic.
 - **Ephemeral Certificates:** Temporary TLS certificates are generated during startup and automatically replaced on restart.
-- **Server Authentication:** Incoming peers must successfully complete server identity validation before joining the mesh.
-- **UUID Tracing:** Every transmitted frame receives a unique identifier for distributed tracing and replay protection.
+- **Peer Metadata:** Control connections include the server ID, IP, host, and configured cluster secret in their WebSocket protocol metadata.
+- **UUID Propagation:** Application payloads retain the same UUID across IPC and mesh routing.
 
 ---
 
@@ -299,7 +303,7 @@ ServerMesh.on("mesh.raw_message", handler);
 | Variable | Default | Description |
 | --- | --- | --- |
 | `MESH_PORT` | `8090` | Port used for mesh communication. |
-| `CLUSTER_SECRET` | — | Shared secret used during mesh authentication. |
+| `CLUSTER_SECRET` | — | Shared secret included in peer connection metadata. |
 | `SERVER_ID` | Auto Generated | Persistent identifier for the current server node. |
 
 ---
