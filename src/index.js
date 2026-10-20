@@ -117,7 +117,7 @@ export class ServerMesh extends EventEmitter {
         const isPrimary = this.server.isPrimary ?? true;
 
         if (!isPrimary) {
-            console.log(`[@cocreate/server-mesh] Initialized mesh layer in worker process context`);
+            console.log(`[@cocreate/server-mesh] [WORKER ${this.server.workerId}] Initialized mesh layer in worker process context`);
             return this;
         }
 
@@ -125,7 +125,7 @@ export class ServerMesh extends EventEmitter {
         await this.inboundManager.init(this.server);
         await this.outboundManager.init(this.server);
 
-        console.log(`[@cocreate/server-mesh] Initialized server mesh layer for node ${this.server.id || 'unassigned'}`);
+        console.log(`[@cocreate/server-mesh] [MASTER] Initialized server mesh layer for node ${this.server.id || 'unassigned'}`);
         return this;
     }
 

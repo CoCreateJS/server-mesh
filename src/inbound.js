@@ -98,7 +98,7 @@ export class ServerMeshInbound {
 
         await new Promise((resolve) => {
             this.secureMeshServer.listen(this.meshPort, '0.0.0.0', () => {
-                console.log(`[@cocreate/server-mesh/inbound] [PRIMARY] Inbound mesh listening on 0.0.0.0:${this.meshPort}`);
+                console.log(`[@cocreate/server-mesh/inbound] [MASTER] Inbound mesh listening on 0.0.0.0:${this.meshPort}`);
                 resolve();
             });
         });
@@ -143,7 +143,7 @@ export class ServerMeshInbound {
             ws.on('pong', () => { ws.isAlive = true; });
 
             ws.on('message', (rawData) => {
-                this.handleInboundSocketMessage(rawData, ws);
+                this.mesh.handleIncomingMessage(rawData, ws);
             });
 
             ws.on('close', () => {
