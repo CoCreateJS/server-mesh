@@ -20,6 +20,23 @@
     "access": "public"
   },
   "type": "module",
+  "cocreate": {
+    "environment": [
+      "server"
+    ],
+    "interface": {
+      "schemaVersion": 1,
+      "summary": "Decentralized, event-driven P2P server mesh and transport fabric for CoCreate Server. Optimizes multi-tenant cluster concurrency with dynamic, tenant-isolated WebSocket data tunnels.",
+      "source": "src/index.js",
+      "api": {
+        "exports": [
+          "ServerMesh",
+          "default",
+          "serverMesh"
+        ]
+      }
+    }
+  },
   "main": "./src/index.js",
   "scripts": {
     "demo": "PORT=5000 node demo/server.js",
