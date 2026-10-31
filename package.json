@@ -49,9 +49,9 @@
   "author": "CoCreate LLC",
   "license": "AGPL-3.0",
   "bugs": {
-    "url": "https://github.com/CoCreate-app/CoCreate-server-mesh/issues"
+    "url": "https://github.com/CoCreateJS/CoCreate-server-mesh/issues"
   },
-  "homepage": "https://cocreate.app/docs/CoCreate-server-mesh",
+  "homepage": "https://CoCreateJS.com/docs/CoCreate-server-mesh",
   "dependencies": {
     "ws": "^8.21.0"
   }

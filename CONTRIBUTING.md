@@ -1,19 +1,19 @@
 # Contributing to CoCreateWS
 
-This project is work of [many contributors](https://github.com/CoCreate-app/CoCreateWS/graphs/contributors).
-You're encouraged to submit [pull requests](https://github.com/CoCreate-app/CoCreateWS/pulls),
-[propose features and discuss issues](https://github.com/CoCreate-app/CoCreateWS/issues).
+This project is work of [many contributors](https://github.com/CoCreateJS/CoCreateWS/graphs/contributors).
+You're encouraged to submit [pull requests](https://github.com/CoCreateJS/CoCreateWS/pulls),
+[propose features and discuss issues](https://github.com/CoCreateJS/CoCreateWS/issues).
 
 In the examples below, substitute your Github username for `contributor` in URLs.
 
 ## Fork the Project
 
-Fork the [project on Github](https://github.com/CoCreate-app/CoCreateWS) and check out your copy.
+Fork the [project on Github](https://github.com/CoCreateJS/CoCreateWS) and check out your copy.
 
 ```
 git boilerplate https://github.com/contributor/CoCreateWS.git
 cd CoCreateWS
-git remote add upstream https://github.com/CoCreate-app/CoCreateWS.git
+git remote add upstream https://github.com/CoCreateJS/CoCreateWS.git
 ```
 
 ## Create a Topic Branch
@@ -75,7 +75,7 @@ git push origin my-feature-branch
 
 ## Make a Pull Request
 
-Go to [https://github.com/CoCreate-app/CoCreateWS](https://github.com/CoCreate-app/CoCreateWS) and select your feature branch.
+Go to [https://github.com/CoCreateJS/CoCreateWS](https://github.com/CoCreateJS/CoCreateWS) and select your feature branch.
 Click the 'Pull Request' button and fill out the form. Pull requests are usually reviewed within a few days.
 
 ## Rebase
