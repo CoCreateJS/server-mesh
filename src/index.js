@@ -21,6 +21,8 @@ import { ServerMeshOutbound } from './outbound.js';
 /**
  * ServerMesh orchestrates multi-tenant routing, unified IPC event forwarding,
  * shared active connection pools, and coordinates ServerMeshInbound and ServerMeshOutbound.
+ * @public
+ * @environment server
  */
 export class ServerMesh extends EventEmitter {
     constructor() {
@@ -98,10 +100,12 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Initializes the ServerMesh orchestrator with the CoCreateServer instance context.
-     * 
+     *
      * @param {Object} server - CoCreateServer instance
      * @returns {Promise<ServerMesh>}
-     */
+ * @private
+ * @environment server
+ */
     async init(server) {
         if (!server) {
             throw new Error('[@cocreate/server-mesh] Failed to initialize: server instance is required.');
@@ -131,7 +135,9 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Binds IPC message and broadcasting event handlers to this.server.
-     */
+ * @private
+ * @environment server
+ */
     setupServerListeners() {
         if (!this.server || typeof this.server.on !== 'function') return;
 
@@ -151,9 +157,11 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Handles inbound IPC payloads from server.on('mesh').
-     * 
+     *
      * @param {Object} payload - IPC message containing 'method' property
-     */
+ * @private
+ * @environment server
+ */
     handleIPCPayload(payload) {
         if (!payload || typeof payload !== 'object' || !payload.method) return;
 
@@ -193,7 +201,9 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Registers protocol handlers for multi-tenant subscriptions and consensus events.
-     */
+ * @private
+ * @environment server
+ */
     setupProtocolListeners() {
         this.on('mesh.orgAdded', (message, ws) => {
             if (!ws) return;
@@ -264,10 +274,12 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Parses incoming network socket payloads and dispatches events.
-     * 
-     * @param {string|Buffer} rawData 
+     *
+     * @param {string|Buffer} rawData
      * @param {Object} ws - Active network socket reference
-     */
+ * @private
+ * @environment server
+ */
     handleIncomingMessage(rawData, ws) {
         let message;
         try {
@@ -346,9 +358,11 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Transmits payload across active network socket tunnels or targeted servers.
-     * 
-     * @param {Object} payload 
-     */
+     *
+     * @param {Object} payload
+ * @private
+ * @environment server
+ */
     send(payload) {
         if (!payload || typeof payload !== 'object' || !payload.method) {
             console.error("[@cocreate/server-mesh] Cannot transmit mesh payload without a defined 'method' key.");
@@ -393,10 +407,12 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Safely serializes and sends payload data across network sockets without direct library coupling.
-     * 
+     *
      * @param {Object|Object[]} sockets - Target socket reference(s)
-     * @param {Object} data 
-     */
+     * @param {Object} data
+ * @private
+ * @environment server
+ */
     socketSend(sockets, data) {
         const targetSockets = Array.isArray(sockets) ? sockets : [sockets];
         const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
@@ -415,9 +431,11 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Safely removes a closed socket connection from tenant routing maps.
-     * 
-     * @param {Object} ws 
-     */
+     *
+     * @param {Object} ws
+ * @private
+ * @environment server
+ */
     removeSocketFromAllOrgServers(ws) {
         for (const [key, socket] of this.activeConnections) {
             if (socket === ws) this.activeConnections.delete(key);
@@ -434,16 +452,20 @@ export class ServerMesh extends EventEmitter {
 
     /**
      * Internal server event handler callback.
-     */
+ * @private
+ * @environment server
+ */
     handleServerEvent(payload) {
         this.send(payload);
     }
 
     /**
      * Initiates coordinated mesh shutdown, closing server ports and outbound timers.
-     * 
+     *
      * @returns {Promise<void>}
-     */
+ * @private
+ * @environment server
+ */
     async close() {
         if (this.isClosed) return;
         this.isClosed = true;
@@ -472,5 +494,25 @@ export class ServerMesh extends EventEmitter {
 }
 
 // Export singleton instance as default export and named export
+/**
+ *
+ * @public
+ * @environment server
+ */
 export const serverMesh = new ServerMesh();
 export default serverMesh;
+
+/**
+ *
+ * @name default
+ * @kind member
+ * @public
+ * @environment server
+ */
+
+/**
+ * Decentralized, event-driven P2P server mesh and transport fabric for CoCreate Server. Optimizes multi-tenant cluster concurrency with dynamic, tenant-isolated WebSocket data tunnels.
+ *
+ * @module server-mesh
+ * @environment server
+ */
