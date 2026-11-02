@@ -31,7 +31,7 @@ For complete API references, deployment guides, and architecture documentation, 
 
 ## Overview
 
-`@cocreate/server-mesh` is the inter-server transport plane for `@cocreate/server`. It establishes TLS WebSocket connections between server nodes for control messages and organization-scoped data propagation.
+`@cocreate/server-mesh` is the inter-server transport plane for `@cocreate/cluster`. It establishes TLS WebSocket connections between server nodes for control messages and organization-scoped data propagation.
 
 IPC handles local worker routing. Server mesh handles only connections and messages between servers.
 
@@ -42,7 +42,7 @@ IPC handles local worker routing. Server mesh handles only connections and messa
 - **Ephemeral TLS:** Automatically generates temporary TLS credentials for encrypted node-to-node communication.
 - **Polymorphic Target Directives:** Unicast, multicast, broadcast, worker-specific, or tenant-aware routing using a unified payload format.
 - **Message Identity:** Preserves an existing `uuid` and creates one for payloads sent through `ServerMesh.send()` when absent.
-- **Tenant Isolation:** Tracks tenant-to-server membership so messages are only delivered to nodes actively serving an organization. Local worker membership is owned by `@cocreate/server` IPC.
+- **Tenant Isolation:** Tracks tenant-to-server membership so messages are only delivered to nodes actively serving an organization. Local worker membership is owned by `@cocreate/cluster` IPC.
 - **Connection Recovery:** Unexpected network disconnects retry automatically; intentional organization shutdowns do not reconnect.
 - **Cluster IPC Integration:** Transparently bridges Node.js Primary and Worker processes while extending communication across distributed servers.
 - **Control and Organization Sockets:** Uses pathless sockets for server control and `/<organization_id>` sockets for organization traffic.
@@ -99,7 +99,7 @@ yarn add @cocreate/server-mesh
 
 > **Note**
 >
-> `@cocreate/server-mesh` integrates directly with `@cocreate/server`, but it can also be initialized independently.
+> `@cocreate/server-mesh` integrates directly with `@cocreate/cluster`, but it can also be initialized independently.
 
 ---
 
@@ -108,7 +108,7 @@ yarn add @cocreate/server-mesh
 ### Initialize
 
 ```javascript
-import CoCreateServer from "@cocreate/server";
+import CoCreateServer from "@cocreate/cluster";
 import ServerMesh from "@cocreate/server-mesh";
 
 await ServerMesh.init(CoCreateServer);
